@@ -15,7 +15,7 @@ class FlatTensor:
     """
     __slots__ = (
         'rows', 'cols', 'data', 'grad', '_backward', '_prev',
-        'm', 'v', 'q_data', 'q_scale', 'requires_grad'
+        'm', 'v', 'q_data', 'q_scale', 'requires_grad', 'aux_loss'
     )
 
     def __init__(self, rows, cols, data=None, _children=(), requires_grad=True):
@@ -31,6 +31,7 @@ class FlatTensor:
         self.q_data = None
         self.q_scale = 1.0
         self.requires_grad = requires_grad
+        self.aux_loss = 0.0
 
     @staticmethod
     def randn(rows, cols, std=0.08, requires_grad=True):
@@ -355,9 +356,18 @@ class FlatTensor:
         return out
 
     @staticmethod
-    def sparse_moe_combine(router_logits, expert_outputs_map, expert_token_positions, selected_experts, selected_probs, top_k=2):
+    def sparse_moe_combine(
+        router_logits,
+        expert_outputs_map,
+        expert_token_positions,
+        selected_experts,
+        selected_probs,
+        top_k=2,
+        aux_loss_coeff=0.01,
+    ):
         """
-        Combines sparse expert outputs where each expert only processed its routed tokens.
+        Combines sparse expert outputs with Switch Transformer auxiliary load-balancing loss
+        to prevent expert collapse.
         """
         T, N_E = router_logits.rows, router_logits.cols
         if not expert_outputs_map:
@@ -378,8 +388,25 @@ class FlatTensor:
                 for d in range(D):
                     out_data[tD + d] += p * e_data[posD + d]
 
+        # Calculate Switch Transformer Auxiliary Load-Balancing Loss
+        P_full = []
+        f = [0.0] * N_E
+        for t in range(T):
+            tE = t * N_E
+            row = router_logits.data[tE : tE + N_E]
+            max_r = max(row)
+            exps = [math.exp(x - max_r) for x in row]
+            s = sum(exps)
+            P_full.append([e / s for e in exps])
+            for e in selected_experts[t]:
+                f[e] += 1.0 / T
+
+        P_mean = [sum(P_full[t][e] for t in range(T)) / T for e in range(N_E)]
+        aux_loss = aux_loss_coeff * N_E * sum(f[e] * P_mean[e] for e in range(N_E)) if aux_loss_coeff > 0.0 else 0.0
+
         children = (router_logits,) + tuple(expert_outputs_map.values())
         out = FlatTensor(T, D, out_data, children)
+        out.aux_loss = aux_loss
 
         def _backward():
             dOut = out.grad
@@ -410,6 +437,13 @@ class FlatTensor:
                     weighted_c = sum(probs[m] * c_dots[m] for m in range(top_k))
                     for m, e in enumerate(ranked):
                         dR[tE + e] += probs[m] * (c_dots[m] - weighted_c)
+
+                    if aux_loss_coeff > 0.0:
+                        scale_aux = (aux_loss_coeff * N_E) / T
+                        p_row = P_full[t]
+                        dot_pf = sum(p_row[j] * f[j] for j in range(N_E))
+                        for e in range(N_E):
+                            dR[tE + e] += scale_aux * p_row[e] * (f[e] - dot_pf)
 
         out._backward = _backward
         return out

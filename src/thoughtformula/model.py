@@ -25,6 +25,7 @@ class ModernMicroGPT:
         expert_hidden=24,
         lora_rank=4,
         lora_alpha=8.0,
+        moe_aux_loss_coeff=0.01,
     ):
         assert n_embd % n_heads == 0 and (n_embd // n_heads) % 2 == 0
         assert n_heads % n_kv_heads == 0
@@ -41,8 +42,10 @@ class ModernMicroGPT:
         self.lora_rank = lora_rank
         self.lora_alpha = lora_alpha
         self.lora_scale = lora_alpha / max(1, lora_rank)
+        self.moe_aux_loss_coeff = moe_aux_loss_coeff
         self.total_steps = 0
         self.lora_steps = 0
+        self.last_aux_loss = 0.0
         self.max_seq_len = 256
 
         # Precomputed RoPE (cos, sin) lookup tables up to max_seq_len
@@ -329,15 +332,19 @@ class ModernMicroGPT:
                 selected_experts,
                 selected_probs,
                 top_k=top_k,
+                aux_loss_coeff=self.moe_aux_loss_coeff,
             )
 
+        aux_loss = getattr(moe_out, "aux_loss", 0.0)
         A, B = self.lora[p + "moe_adapt"]
         if A.requires_grad or any(v != 0.0 for v in B.data):
             moe_out = moe_out + x_norm2.matmul(A).matmul(B).scale(self.lora_scale)
+        moe_out.aux_loss = aux_loss
 
         return moe_out
 
     def forward(self, idx_seq, start_pos=0, kv_caches=None, use_int8=False):
+        self.last_aux_loss = 0.0
         w = self.weights
         x = FlatTensor.embedding(w["tok_emb"], idx_seq)
 
@@ -358,6 +365,7 @@ class ModernMicroGPT:
             # 2. Pre-Norm Sparse Mixture-of-Experts (MoE) SwiGLU + LoRA
             x_norm2 = x.rmsnorm()
             moe_out = self._forward_moe_block(x_norm2, l, use_int8=use_int8)
+            self.last_aux_loss += getattr(moe_out, "aux_loss", 0.0)
             x = x + moe_out
 
         logits = self.apply_linear_with_lora(x.rmsnorm(), "lm_head", use_int8=use_int8) + w["b_head"]

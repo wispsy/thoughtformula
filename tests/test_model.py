@@ -43,6 +43,21 @@ class TestModernMicroGPT(unittest.TestCase):
         self.assertEqual(logits.rows, 4)
         self.assertEqual(logits.cols, 32)
 
+    def test_moe_aux_loss_calculation(self):
+        model = ModernMicroGPT(
+            vocab_size=32,
+            n_embd=16,
+            n_heads=2,
+            n_kv_heads=1,
+            n_layers=1,
+            n_experts=4,
+            moe_top_k=2,
+            expert_hidden=16,
+            moe_aux_loss_coeff=0.05,
+        )
+        logits = model.forward([1, 2, 3, 4], use_int8=False)
+        self.assertTrue(model.last_aux_loss > 0.0)
+
     def test_forward_sparse_moe_training_grad(self):
         model = ModernMicroGPT(
             vocab_size=32,
