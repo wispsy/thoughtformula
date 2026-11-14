@@ -371,13 +371,17 @@ class ModernMicroGPT:
         logits = self.apply_linear_with_lora(x.rmsnorm(), "lm_head", use_int8=use_int8) + w["b_head"]
         return logits
 
-    def _adam_update_tensor(self, param, lr, b1_corr, b2_corr):
+    def _adam_update_tensor(self, param, lr, b1_corr, b2_corr, weight_decay=0.0):
         N_el = param.rows * param.cols
         if param.m is None or len(param.m) != N_el:
             param.m = array('d', [0.0] * N_el)
             param.v = array('d', [0.0] * N_el)
         pd, pg, pm, pv = param.data, param.grad, param.m, param.v
+        decay_factor = (1.0 - lr * weight_decay) if weight_decay > 0.0 else 1.0
+
         for i in range(N_el):
+            if weight_decay > 0.0:
+                pd[i] *= decay_factor
             g = pg[i]
             if g > 1.0:
                 g = 1.0
@@ -390,23 +394,25 @@ class ModernMicroGPT:
             pd[i] -= lr * m_hat / (math.sqrt(v_hat) + 1e-8)
             pg[i] = 0.0
 
-    def step_adam(self, lr, lora_only=False):
+    def step_adam(self, lr, lora_only=False, weight_decay=0.01):
+        """AdamW step with decoupled weight decay to bound weight scales and preserve Int8 dynamic range."""
         if lora_only:
             self.lora_steps += 1
             b1_corr = 1.0 - 0.9 ** self.lora_steps
             b2_corr = 1.0 - 0.999 ** self.lora_steps
             for A, B in self.lora.values():
-                self._adam_update_tensor(A, lr, b1_corr, b2_corr)
-                self._adam_update_tensor(B, lr, b1_corr, b2_corr)
-            self._adam_update_tensor(self.weights["tok_emb"], lr * 0.5, b1_corr, b2_corr)
-            self._adam_update_tensor(self.weights["b_head"], lr * 0.5, b1_corr, b2_corr)
+                self._adam_update_tensor(A, lr, b1_corr, b2_corr, weight_decay=weight_decay)
+                self._adam_update_tensor(B, lr, b1_corr, b2_corr, weight_decay=weight_decay)
+            self._adam_update_tensor(self.weights["tok_emb"], lr * 0.5, b1_corr, b2_corr, weight_decay=weight_decay)
+            self._adam_update_tensor(self.weights["b_head"], lr * 0.5, b1_corr, b2_corr, weight_decay=0.0)
         else:
             self.total_steps += 1
             b1_corr = 1.0 - 0.9 ** self.total_steps
             b2_corr = 1.0 - 0.999 ** self.total_steps
-            for param in self.weights.values():
+            for name, param in self.weights.items():
                 if param.requires_grad:
-                    self._adam_update_tensor(param, lr, b1_corr, b2_corr)
+                    wd = 0.0 if ("b_head" in name or param.rows == 1) else weight_decay
+                    self._adam_update_tensor(param, lr, b1_corr, b2_corr, weight_decay=wd)
 
     @staticmethod
     def get_probs(logits_row, temperature=0.05, top_k=6, top_p=0.9):

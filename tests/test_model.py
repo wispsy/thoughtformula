@@ -1,5 +1,6 @@
 """Unit tests for ModernMicroGPT."""
 
+from array import array
 import os
 import tempfile
 import unittest
@@ -57,6 +58,15 @@ class TestModernMicroGPT(unittest.TestCase):
         )
         logits = model.forward([1, 2, 3, 4], use_int8=False)
         self.assertTrue(model.last_aux_loss > 0.0)
+
+    def test_adamw_weight_decay(self):
+        # Verify that decoupled weight decay reduces weight magnitude even when gradient is zero
+        t = FlatTensor(1, 4, array('d', [2.0, 2.0, 2.0, 2.0]), requires_grad=True)
+        t.grad = array('d', [0.0, 0.0, 0.0, 0.0])
+        self.model._adam_update_tensor(t, lr=0.1, b1_corr=1.0, b2_corr=1.0, weight_decay=0.1)
+        # Expected: pd *= (1 - 0.1 * 0.1) = 2.0 * 0.99 = 1.98
+        for val in t.data:
+            self.assertAlmostEqual(val, 1.98, places=5)
 
     def test_forward_sparse_moe_training_grad(self):
         model = ModernMicroGPT(
