@@ -167,24 +167,42 @@ class FlatTensor:
         out._backward = _backward
         return out
 
+    def transpose(self):
+        """Returns a transposed FlatTensor [cols, rows]."""
+        R, C = self.rows, self.cols
+        transposed_data = array('d', [0.0] * (R * C))
+        for r in range(R):
+            rC = r * C
+            for c in range(C):
+                transposed_data[c * R + r] = self.data[rC + c]
+        t = FlatTensor(C, R, transposed_data, requires_grad=self.requires_grad)
+        if self.q_data is not None and len(self.q_data) == R * C:
+            q_trans = array('b', [0] * (R * C))
+            for r in range(R):
+                rC = r * C
+                for c in range(C):
+                    q_trans[c * R + r] = self.q_data[rC + c]
+            t.q_data = q_trans
+            t.q_scale = self.q_scale
+        return t
+
     def matmul(self, other, use_int8=False):
         if use_int8:
             return self.matmul_int8(other)
 
         M, K, N = self.rows, self.cols, other.cols
         A, B = self.data, other.data
-        out_data = array('d', [0.0] * (M * N))
 
-        for i in range(M):
-            iK = i * K
-            iN = i * N
-            for k in range(K):
-                a_ik = A[iK + k]
-                if a_ik == 0.0:
-                    continue
-                kN = k * N
-                for j in range(N):
-                    out_data[iN + j] += a_ik * B[kN + j]
+        # Transpose B into B_T of shape [N, K] for contiguous C-level math.sumprod slices
+        B_T = array('d', [0.0] * (K * N))
+        for k in range(K):
+            kN = k * N
+            for j in range(N):
+                B_T[j * K + k] = B[kN + j]
+
+        A_rows = [memoryview(A)[i * K : (i + 1) * K] for i in range(M)]
+        B_cols = [memoryview(B_T)[j * K : (j + 1) * K] for j in range(N)]
+        out_data = array('d', (math.sumprod(a_row, b_col) for a_row in A_rows for b_col in B_cols))
 
         out = FlatTensor(M, N, out_data, (self, other))
 
@@ -195,40 +213,38 @@ class FlatTensor:
             comp_A = self.requires_grad
             comp_B = other.requires_grad
 
-            if comp_A and comp_B:
+            dOut_rows = [memoryview(dOut)[i * N : (i + 1) * N] for i in range(M)]
+
+            if comp_A:
+                # dA = dOut @ B.T where B is [K, N], so row k of B is col k of B.T
+                B_rows = [memoryview(B)[k * N : (k + 1) * N] for k in range(K)]
                 for i in range(M):
                     iK = i * K
-                    iN = i * N
+                    d_row = dOut_rows[i]
                     for k in range(K):
-                        a_ik = A[iK + k]
-                        kN = k * N
-                        s = 0.0
-                        for j in range(N):
-                            dout_ij = dOut[iN + j]
-                            s += dout_ij * B[kN + j]
-                            dB[kN + j] += a_ik * dout_ij
-                        dA[iK + k] += s
-            elif comp_A:
+                        dA[iK + k] += math.sumprod(d_row, B_rows[k])
+
+            if comp_B:
+                # dB = A.T @ dOut. A.T is [K, M], dOut is [M, N]
+                A_T = array('d', [0.0] * (M * K))
                 for i in range(M):
                     iK = i * K
-                    iN = i * N
                     for k in range(K):
-                        kN = k * N
-                        s = 0.0
-                        for j in range(N):
-                            s += dOut[iN + j] * B[kN + j]
-                        dA[iK + k] += s
-            elif comp_B:
+                        A_T[k * M + i] = A[iK + k]
+                dOut_T = array('d', [0.0] * (M * N))
                 for i in range(M):
-                    iK = i * K
                     iN = i * N
-                    for k in range(K):
-                        a_ik = A[iK + k]
-                        if a_ik == 0.0:
-                            continue
-                        kN = k * N
-                        for j in range(N):
-                            dB[kN + j] += a_ik * dOut[iN + j]
+                    for j in range(N):
+                        dOut_T[j * M + i] = dOut[iN + j]
+
+                A_T_rows = [memoryview(A_T)[k * M : (k + 1) * M] for k in range(K)]
+                dOut_T_rows = [memoryview(dOut_T)[j * M : (j + 1) * M] for j in range(N)]
+
+                for k in range(K):
+                    kN = k * N
+                    a_t_row = A_T_rows[k]
+                    for j in range(N):
+                        dB[kN + j] += math.sumprod(a_t_row, dOut_T_rows[j])
 
         out._backward = _backward
         return out
@@ -254,20 +270,18 @@ class FlatTensor:
 
         B_q = other.q_data
         combined_scale = scale_a * other.q_scale
-        out_int = [0] * (M * N)
 
-        for i in range(M):
-            iK = i * K
-            iN = i * N
-            for k in range(K):
-                a_ik = A_q[iK + k]
-                if a_ik == 0:
-                    continue
-                kN = k * N
-                for j in range(N):
-                    out_int[iN + j] += a_ik * B_q[kN + j]
+        # Transpose B_q into B_T_q for contiguous C-level math.sumprod
+        B_T_q = array('b', [0] * (K * N))
+        for k in range(K):
+            kN = k * N
+            for j in range(N):
+                B_T_q[j * K + k] = B_q[kN + j]
 
-        out_data = array('d', (val * combined_scale for val in out_int))
+        A_rows = [memoryview(A_q)[i * K : (i + 1) * K] for i in range(M)]
+        B_cols = [memoryview(B_T_q)[j * K : (j + 1) * K] for j in range(N)]
+
+        out_data = array('d', (math.sumprod(a_row, b_col) * combined_scale for a_row in A_rows for b_col in B_cols))
         return FlatTensor(M, N, out_data)
 
     def rmsnorm(self, eps=1e-5):

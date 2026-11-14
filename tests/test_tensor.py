@@ -111,6 +111,30 @@ class TestFlatTensor(unittest.TestCase):
         # sigmoid(2) = 1 / (1 + e^-2) ~ 0.8808 -> 2.0 * 0.8808 * 4.0 ~ 7.046
         self.assertTrue(out.data[1] > 6.0)
 
+    def test_transpose(self):
+        A = FlatTensor(2, 3, array('d', [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]))
+        A.quantize_int8()
+        AT = A.transpose()
+        self.assertEqual(AT.rows, 3)
+        self.assertEqual(AT.cols, 2)
+        self.assertEqual(list(AT.data), [1.0, 4.0, 2.0, 5.0, 3.0, 6.0])
+        self.assertIsNotNone(AT.q_data)
+        self.assertEqual(len(AT.q_data), 6)
+
+    def test_matmul_sumprod_backward_both_grads(self):
+        A = FlatTensor(2, 2, array('d', [1.0, 2.0, 3.0, 4.0]), requires_grad=True)
+        B = FlatTensor(2, 2, array('d', [0.5, -0.5, 1.0, 2.0]), requires_grad=True)
+        C = A.matmul(B)
+        C.backward()
+        # When C.backward() is called on [2, 2], grad[0] = 1.0, grad[1:] = 0.0
+        # dOut = [[1.0, 0.0], [0.0, 0.0]]
+        # dA = dOut @ B^T = [[0.5, 1.0], [0.0, 0.0]]
+        # dB = A^T @ dOut = [[1.0, 0.0], [2.0, 0.0]]
+        self.assertAlmostEqual(A.grad[0], 0.5)
+        self.assertAlmostEqual(A.grad[1], 1.0)
+        self.assertAlmostEqual(B.grad[0], 1.0)
+        self.assertAlmostEqual(B.grad[2], 2.0)
+
     def test_cross_entropy(self):
         logits = FlatTensor(2, 3, array('d', [10.0, 0.0, 0.0, 0.0, 10.0, 0.0]))
         loss = FlatTensor.cross_entropy(logits, [0, 1])
