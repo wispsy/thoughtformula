@@ -112,10 +112,10 @@ class ModernMicroGPT:
             A.requires_grad = lora_only
             B.requires_grad = lora_only
 
-    def apply_linear_with_lora(self, x, weight_name, use_int8=False):
+    def apply_linear_with_lora(self, x, weight_name, use_int8=False, disable_lora=False):
         W = self.weights[weight_name]
         out = x.matmul(W, use_int8=use_int8)
-        if weight_name in self.lora:
+        if not disable_lora and weight_name in self.lora:
             A, B = self.lora[weight_name]
             if A.requires_grad or any(v != 0.0 for v in B.data):
                 delta = x.matmul(A).matmul(B).scale(self.lora_scale)
@@ -260,7 +260,7 @@ class ModernMicroGPT:
                 del cache["v_scale"][target_len :]
                 cache["seq_len"] = target_len
 
-    def _forward_moe_block(self, x_norm2, layer_idx, use_int8=False):
+    def _forward_moe_block(self, x_norm2, layer_idx, use_int8=False, disable_lora=False):
         p = f"blocks.{layer_idx}."
         w = self.weights
         router_logits = x_norm2.matmul(w[p + "w_router"], use_int8=False)
@@ -336,14 +336,15 @@ class ModernMicroGPT:
             )
 
         aux_loss = getattr(moe_out, "aux_loss", 0.0)
-        A, B = self.lora[p + "moe_adapt"]
-        if A.requires_grad or any(v != 0.0 for v in B.data):
-            moe_out = moe_out + x_norm2.matmul(A).matmul(B).scale(self.lora_scale)
+        if not disable_lora:
+            A, B = self.lora[p + "moe_adapt"]
+            if A.requires_grad or any(v != 0.0 for v in B.data):
+                moe_out = moe_out + x_norm2.matmul(A).matmul(B).scale(self.lora_scale)
         moe_out.aux_loss = aux_loss
 
         return moe_out
 
-    def forward(self, idx_seq, start_pos=0, kv_caches=None, use_int8=False):
+    def forward(self, idx_seq, start_pos=0, kv_caches=None, use_int8=False, disable_lora=False):
         self.last_aux_loss = 0.0
         w = self.weights
         x = FlatTensor.embedding(w["tok_emb"], idx_seq)
@@ -354,22 +355,47 @@ class ModernMicroGPT:
 
             # 1. Pre-Norm GQA with RoPE + LoRA
             x_norm = x.rmsnorm()
-            Q = self.apply_linear_with_lora(x_norm, p + "wq", use_int8=use_int8)
+            Q = self.apply_linear_with_lora(x_norm, p + "wq", use_int8=use_int8, disable_lora=disable_lora)
             K = x_norm.matmul(w[p + "wk"], use_int8=use_int8)
-            V = self.apply_linear_with_lora(x_norm, p + "wv", use_int8=use_int8)
+            V = self.apply_linear_with_lora(x_norm, p + "wv", use_int8=use_int8, disable_lora=disable_lora)
             attn_out = FlatTensor.rope_gqa(
                 Q, K, V, self.n_heads, self.n_kv_heads, start_pos=start_pos, kv_cache=layer_cache, rope_cache=self.rope_cache
             )
-            x = x + self.apply_linear_with_lora(attn_out, p + "wo", use_int8=use_int8)
+            x = x + self.apply_linear_with_lora(attn_out, p + "wo", use_int8=use_int8, disable_lora=disable_lora)
 
             # 2. Pre-Norm Sparse Mixture-of-Experts (MoE) SwiGLU + LoRA
             x_norm2 = x.rmsnorm()
-            moe_out = self._forward_moe_block(x_norm2, l, use_int8=use_int8)
+            moe_out = self._forward_moe_block(x_norm2, l, use_int8=use_int8, disable_lora=disable_lora)
             self.last_aux_loss += getattr(moe_out, "aux_loss", 0.0)
             x = x + moe_out
 
-        logits = self.apply_linear_with_lora(x.rmsnorm(), "lm_head", use_int8=use_int8) + w["b_head"]
+        logits = self.apply_linear_with_lora(x.rmsnorm(), "lm_head", use_int8=use_int8, disable_lora=disable_lora) + w["b_head"]
         return logits
+
+    def compute_sequence_log_probs(self, prompt_len, seq_ids, disable_lora=False):
+        """
+        Computes total log-probability of target tokens seq_ids[prompt_len:] conditioned on seq_ids[:prompt_len].
+        Returns (sum_log_prob, logits, probs_per_pos).
+        """
+        logits = self.forward(seq_ids, disable_lora=disable_lora, use_int8=False)
+        T, V = logits.rows, logits.cols
+        sum_log_prob = 0.0
+        probs_per_pos = []
+
+        for t in range(T):
+            row = logits.data[t * V : (t + 1) * V]
+            max_l = max(row)
+            exps = [math.exp(x - max_l) for x in row]
+            sum_e = sum(exps)
+            probs = [e / sum_e for e in exps]
+            probs_per_pos.append(probs)
+
+            # Prediction at position t predicts token at t + 1
+            if t >= prompt_len - 1 and (t + 1) < len(seq_ids):
+                target_token = seq_ids[t + 1]
+                sum_log_prob += math.log(max(1e-12, probs[target_token]))
+
+        return sum_log_prob, logits, probs_per_pos
 
     def _adam_update_tensor(self, param, lr, b1_corr, b2_corr, weight_decay=0.0):
         N_el = param.rows * param.cols

@@ -5,7 +5,7 @@ from .draft import NGramDraftModel
 from .rag import PurePythonBM25RAG
 from .tokenizer import BPETokenizer
 from .model import ModernMicroGPT
-from .training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn
+from .training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn, train_dpo_turn
 from .cli import main
 
 __version__ = "0.1.0"
@@ -19,6 +19,7 @@ __all__ = [
     "get_cosine_lr",
     "build_training_sequences",
     "continual_learn_lora_turn",
+    "train_dpo_turn",
     "main",
     "__version__",
 ]

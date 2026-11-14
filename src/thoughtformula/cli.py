@@ -11,7 +11,7 @@ from .tokenizer import BPETokenizer
 from .rag import PurePythonBM25RAG
 from .draft import NGramDraftModel
 from .model import ModernMicroGPT
-from .training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn
+from .training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn, train_dpo_turn
 
 
 DEFAULT_KNOWLEDGE = [
@@ -151,21 +151,36 @@ def run_repl(model, tokenizer, rag_engine, ngram_drafter, corpus_segments, ckpt_
             )
             continue
 
-        # Case A: Teach a new Q&A turn using instant LoRA Continual Learning
+        # Case A: Teach via Direct Preference Optimization (q :: good || bad) or LoRA Continual Learning (q :: a)
         if "::" in user_in:
             q_part, a_part = user_in.split("::", 1)
-            t_lora = time.perf_counter()
-            loss_after, minted = continual_learn_lora_turn(
-                model, tokenizer, rag_engine, ngram_drafter, corpus_segments, q_part, a_part, ckpt_path, block_size
-            )
-            dt_lora = (time.perf_counter() - t_lora) * 1000.0
-            file_kb = os.path.getsize(ckpt_path) / 1024.0
-            mint_msg = f"Minted BPE: {', '.join(minted)} | " if minted else ""
-            print(
-                f"[{mint_msg}LoRA Adapted in {dt_lora:.0f} ms | Loss: {loss_after:.4f} | "
-                f"Saved '{ckpt_path}' ({file_kb:.1f} KB)]"
-            )
-            user_in = q_part.strip()
+            if "||" in a_part:
+                good_part, bad_part = a_part.split("||", 1)
+                t_dpo = time.perf_counter()
+                dpo_loss, margin = train_dpo_turn(
+                    model, tokenizer, q_part.strip(), good_part.strip(), bad_part.strip()
+                )
+                dt_dpo = (time.perf_counter() - t_dpo) * 1000.0
+                model.save_checkpoint(ckpt_path, tokenizer, rag_engine, corpus_segments)
+                file_kb = os.path.getsize(ckpt_path) / 1024.0
+                print(
+                    f"[LoRA DPO Adapted in {dt_dpo:.0f} ms | Loss: {dpo_loss:.4f} | Margin: {margin:+.3f} | "
+                    f"Saved '{ckpt_path}' ({file_kb:.1f} KB)]"
+                )
+                user_in = q_part.strip()
+            else:
+                t_lora = time.perf_counter()
+                loss_after, minted = continual_learn_lora_turn(
+                    model, tokenizer, rag_engine, ngram_drafter, corpus_segments, q_part, a_part, ckpt_path, block_size
+                )
+                dt_lora = (time.perf_counter() - t_lora) * 1000.0
+                file_kb = os.path.getsize(ckpt_path) / 1024.0
+                mint_msg = f"Minted BPE: {', '.join(minted)} | " if minted else ""
+                print(
+                    f"[{mint_msg}LoRA Adapted in {dt_lora:.0f} ms | Loss: {loss_after:.4f} | "
+                    f"Saved '{ckpt_path}' ({file_kb:.1f} KB)]"
+                )
+                user_in = q_part.strip()
 
         # Case B: Retrieve context via BM25 RAG and answer via Speculative Decoding
         retrieved = rag_engine.retrieve(user_in, top_k=1)

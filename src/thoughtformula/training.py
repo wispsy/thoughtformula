@@ -90,3 +90,82 @@ def continual_learn_lora_turn(
         model.save_checkpoint(ckpt_path, tokenizer, rag_engine, corpus_segments)
     minted_labels = [f"'{tokenizer.vocab[nid]}' (id={nid})" for nid, _, _ in new_tokens_info]
     return last_loss, minted_labels
+
+
+def train_dpo_turn(
+    model,
+    tokenizer,
+    question,
+    chosen_answer,
+    rejected_answer,
+    beta=0.1,
+    lr=0.01,
+    epochs=10,
+    weight_decay=0.01,
+):
+    """
+    Zero-Memory Direct Preference Optimization (DPO) via LoRA:
+    Uses frozen base weights (disable_lora=True) as reference model π_ref with 0 extra RAM,
+    optimizing active LoRA adapters to maximize preference margin between chosen and rejected answers.
+    """
+    prompt = tokenizer.format_rag_prompt(chosen_answer, question)
+    p_ids = tokenizer.encode(prompt)
+    prompt_len = len(p_ids)
+
+    w_text = prompt + chosen_answer.strip() + " " + tokenizer.EOS_TOKEN + " "
+    l_text = prompt + rejected_answer.strip() + " " + tokenizer.EOS_TOKEN + " "
+
+    s_w_ids = tokenizer.encode(w_text)
+    s_l_ids = tokenizer.encode(l_text)
+
+    model.set_training_mode(lora_only=True)
+
+    last_dpo_loss = 0.0
+    last_margin = 0.0
+
+    for _ in range(epochs):
+        # 1. Reference log-probs with LoRA disabled (frozen Int8 base weights, zero extra RAM)
+        ref_log_w, _, _ = model.compute_sequence_log_probs(prompt_len, s_w_ids, disable_lora=True)
+        ref_log_l, _, _ = model.compute_sequence_log_probs(prompt_len, s_l_ids, disable_lora=True)
+
+        # 2. Policy log-probs with LoRA enabled
+        pi_log_w, logits_w, probs_w = model.compute_sequence_log_probs(prompt_len, s_w_ids, disable_lora=False)
+        pi_log_l, logits_l, probs_l = model.compute_sequence_log_probs(prompt_len, s_l_ids, disable_lora=False)
+
+        # 3. DPO Loss & reward margin
+        delta_w = pi_log_w - ref_log_w
+        delta_l = pi_log_l - ref_log_l
+        margin = delta_w - delta_l
+        u = beta * margin
+        u_clipped = max(-30.0, min(30.0, u))
+        dpo_loss = math.log(1.0 + math.exp(-u_clipped))
+        sig_neg_u = 1.0 / (1.0 + math.exp(u_clipped))
+
+        last_dpo_loss = dpo_loss
+        last_margin = margin
+
+        # 4. Analytical policy gradients on chosen and rejected logits
+        grad_scale = beta * sig_neg_u
+        V = model.vocab_size
+
+        for t in range(prompt_len - 1, len(s_w_ids) - 1):
+            target_token = s_w_ids[t + 1]
+            p_row = probs_w[t]
+            tV = t * V
+            for v in range(V):
+                indicator = 1.0 if v == target_token else 0.0
+                logits_w.grad[tV + v] += grad_scale * (p_row[v] - indicator)
+
+        for t in range(prompt_len - 1, len(s_l_ids) - 1):
+            target_token = s_l_ids[t + 1]
+            p_row = probs_l[t]
+            tV = t * V
+            for v in range(V):
+                indicator = 1.0 if v == target_token else 0.0
+                logits_l.grad[tV + v] -= grad_scale * (p_row[v] - indicator)
+
+        logits_w.backward()
+        logits_l.backward()
+        model.step_adam(lr, lora_only=True, weight_decay=weight_decay)
+
+    return last_dpo_loss, last_margin

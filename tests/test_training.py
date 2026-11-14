@@ -1,7 +1,7 @@
 """Unit tests for training utilities and continual learning."""
 
 import unittest
-from thoughtformula.training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn
+from thoughtformula.training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn, train_dpo_turn
 from thoughtformula.tokenizer import BPETokenizer
 from thoughtformula.model import ModernMicroGPT
 from thoughtformula.rag import PurePythonBM25RAG
@@ -27,6 +27,33 @@ class TestTraining(unittest.TestCase):
         self.assertTrue(len(seqs) > 0)
         for x, y in seqs:
             self.assertEqual(len(x), len(y))
+
+    def test_train_dpo_turn(self):
+        tok = BPETokenizer()
+        tok.train("what is this model? deep learning in pure python. it is a bad model.", max_merges=6)
+        model = ModernMicroGPT(
+            vocab_size=len(tok.vocab),
+            n_embd=16,
+            n_heads=2,
+            n_kv_heads=1,
+            n_layers=1,
+            n_experts=2,
+            moe_top_k=1,
+            expert_hidden=16,
+            lora_rank=2,
+            lora_alpha=4.0,
+        )
+        dpo_loss, margin = train_dpo_turn(
+            model,
+            tok,
+            question="what is this model?",
+            chosen_answer="deep learning in pure python.",
+            rejected_answer="it is a bad model.",
+            beta=0.1,
+            lr=0.01,
+            epochs=3,
+        )
+        self.assertTrue(dpo_loss > 0.0)
 
     def test_continual_learn_lora_turn(self):
         tok = BPETokenizer()
