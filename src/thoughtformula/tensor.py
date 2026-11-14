@@ -451,14 +451,13 @@ class FlatTensor:
         return out
 
     @staticmethod
-    def rope_gqa(Q, K, V, n_heads, n_kv_heads, start_pos=0, kv_cache=None):
+    def rope_gqa(Q, K, V, n_heads, n_kv_heads, start_pos=0, kv_cache=None, rope_cache=None):
         T, D = Q.rows, Q.cols
         KV_D = K.cols
         head_dim = D // n_heads
         group_size = n_heads // n_kv_heads
         half_d = head_dim // 2
         scale = 1.0 / math.sqrt(head_dim)
-        inv_freq = [1.0 / (10000.0 ** ((2 * m) / head_dim)) for m in range(half_d)]
 
         Q_rot = array('d', [0.0] * (T * D))
         K_rot = array('d', [0.0] * (T * KV_D))
@@ -466,26 +465,52 @@ class FlatTensor:
         sin_table = array('d', [0.0] * (T * half_d))
 
         Qd, Kd, Vd = Q.data, K.data, V.data
-        for t in range(T):
-            pos = start_pos + t
-            tD = t * D
-            tKV = t * KV_D
-            t_half = t * half_d
-            for m in range(half_d):
-                angle = pos * inv_freq[m]
-                c, s = math.cos(angle), math.sin(angle)
-                cos_table[t_half + m] = c
-                sin_table[t_half + m] = s
-                for h in range(n_heads):
-                    base_q = tD + h * head_dim + 2 * m
-                    q0, q1 = Qd[base_q], Qd[base_q + 1]
-                    Q_rot[base_q] = q0 * c - q1 * s
-                    Q_rot[base_q + 1] = q0 * s + q1 * c
-                for kv_h in range(n_kv_heads):
-                    base_k = tKV + kv_h * head_dim + 2 * m
-                    k0, k1 = Kd[base_k], Kd[base_k + 1]
-                    K_rot[base_k] = k0 * c - k1 * s
-                    K_rot[base_k + 1] = k0 * s + k1 * c
+
+        if rope_cache is not None and (start_pos + T) * half_d <= len(rope_cache[0]):
+            cos_buf, sin_buf = rope_cache
+            for t in range(T):
+                pos = start_pos + t
+                tD = t * D
+                tKV = t * KV_D
+                t_half = t * half_d
+                pos_half = pos * half_d
+                for m in range(half_d):
+                    c = cos_buf[pos_half + m]
+                    s = sin_buf[pos_half + m]
+                    cos_table[t_half + m] = c
+                    sin_table[t_half + m] = s
+                    for h in range(n_heads):
+                        base_q = tD + h * head_dim + 2 * m
+                        q0, q1 = Qd[base_q], Qd[base_q + 1]
+                        Q_rot[base_q] = q0 * c - q1 * s
+                        Q_rot[base_q + 1] = q0 * s + q1 * c
+                    for kv_h in range(n_kv_heads):
+                        base_k = tKV + kv_h * head_dim + 2 * m
+                        k0, k1 = Kd[base_k], Kd[base_k + 1]
+                        K_rot[base_k] = k0 * c - k1 * s
+                        K_rot[base_k + 1] = k0 * s + k1 * c
+        else:
+            inv_freq = [1.0 / (10000.0 ** ((2 * m) / head_dim)) for m in range(half_d)]
+            for t in range(T):
+                pos = start_pos + t
+                tD = t * D
+                tKV = t * KV_D
+                t_half = t * half_d
+                for m in range(half_d):
+                    angle = pos * inv_freq[m]
+                    c, s = math.cos(angle), math.sin(angle)
+                    cos_table[t_half + m] = c
+                    sin_table[t_half + m] = s
+                    for h in range(n_heads):
+                        base_q = tD + h * head_dim + 2 * m
+                        q0, q1 = Qd[base_q], Qd[base_q + 1]
+                        Q_rot[base_q] = q0 * c - q1 * s
+                        Q_rot[base_q + 1] = q0 * s + q1 * c
+                    for kv_h in range(n_kv_heads):
+                        base_k = tKV + kv_h * head_dim + 2 * m
+                        k0, k1 = Kd[base_k], Kd[base_k + 1]
+                        K_rot[base_k] = k0 * c - k1 * s
+                        K_rot[base_k + 1] = k0 * s + k1 * c
 
         out_data = array('d', [0.0] * (T * D))
         probs_store = []

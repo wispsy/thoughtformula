@@ -43,6 +43,20 @@ class ModernMicroGPT:
         self.lora_scale = lora_alpha / max(1, lora_rank)
         self.total_steps = 0
         self.lora_steps = 0
+        self.max_seq_len = 256
+
+        # Precomputed RoPE (cos, sin) lookup tables up to max_seq_len
+        half_d = self.head_dim // 2
+        inv_freq = [1.0 / (10000.0 ** ((2 * m) / self.head_dim)) for m in range(half_d)]
+        self.cos_cache = array('d', [0.0] * (self.max_seq_len * half_d))
+        self.sin_cache = array('d', [0.0] * (self.max_seq_len * half_d))
+        for p in range(self.max_seq_len):
+            p_offset = p * half_d
+            for m in range(half_d):
+                ang = p * inv_freq[m]
+                self.cos_cache[p_offset + m] = math.cos(ang)
+                self.sin_cache[p_offset + m] = math.sin(ang)
+        self.rope_cache = (self.cos_cache, self.sin_cache)
 
         res_std = 0.08 / math.sqrt(2.0 * n_layers)
 
@@ -306,7 +320,7 @@ class ModernMicroGPT:
             K = x_norm.matmul(w[p + "wk"], use_int8=use_int8)
             V = self.apply_linear_with_lora(x_norm, p + "wv", use_int8=use_int8)
             attn_out = FlatTensor.rope_gqa(
-                Q, K, V, self.n_heads, self.n_kv_heads, start_pos=start_pos, kv_cache=layer_cache
+                Q, K, V, self.n_heads, self.n_kv_heads, start_pos=start_pos, kv_cache=layer_cache, rope_cache=self.rope_cache
             )
             x = x + self.apply_linear_with_lora(attn_out, p + "wo", use_int8=use_int8)
 

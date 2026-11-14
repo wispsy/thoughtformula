@@ -25,6 +25,17 @@ class TestModernMicroGPT(unittest.TestCase):
             lora_alpha=4.0,
         )
 
+    def test_rope_cache_precomputed(self):
+        self.assertIsNotNone(self.model.rope_cache)
+        cos_buf, sin_buf = self.model.rope_cache
+        half_d = self.model.head_dim // 2
+        self.assertEqual(len(cos_buf), self.model.max_seq_len * half_d)
+        self.assertEqual(len(sin_buf), self.model.max_seq_len * half_d)
+        # Position 0 angle is 0 -> cos is 1, sin is 0
+        for m in range(half_d):
+            self.assertAlmostEqual(cos_buf[m], 1.0)
+            self.assertAlmostEqual(sin_buf[m], 0.0)
+
     def test_forward_shape(self):
         seq = [1, 2, 3, 4]
         logits = self.model.forward(seq, use_int8=False)
