@@ -262,43 +262,74 @@ class ModernMicroGPT:
         w = self.weights
         router_logits = x_norm2.matmul(w[p + "w_router"], use_int8=False)
 
+        T, D = x_norm2.rows, x_norm2.cols
+        N_E = self.n_experts
+        top_k = self.moe_top_k
+        R = router_logits.data
+
+        selected_experts = []
+        selected_probs = []
+        token_indices_per_expert = {e: [] for e in range(N_E)}
+        expert_token_positions = {}
+
+        for t in range(T):
+            tE = t * N_E
+            ranked = sorted(range(N_E), key=lambda e: R[tE + e], reverse=True)[:top_k]
+            max_r = R[tE + ranked[0]]
+            exps = [math.exp(R[tE + e] - max_r) for e in ranked]
+            sum_e = sum(exps)
+            probs = [ex / sum_e for ex in exps]
+
+            selected_experts.append(ranked)
+            selected_probs.append(probs)
+
+            for e in ranked:
+                pos = len(token_indices_per_expert[e])
+                token_indices_per_expert[e].append(t)
+                expert_token_positions[(t, e)] = pos
+
         if use_int8:
-            T, D = x_norm2.rows, x_norm2.cols
-            N_E = self.n_experts
-            top_k = self.moe_top_k
-            R = router_logits.data
             out_data = array('d', [0.0] * (T * D))
+            for e, tok_indices in token_indices_per_expert.items():
+                if not tok_indices:
+                    continue
+                ep = f"{p}experts.{e}."
+                for t in tok_indices:
+                    ranked = selected_experts[t]
+                    m = ranked.index(e)
+                    prob = selected_probs[t][m]
 
-            for t in range(T):
-                tE = t * N_E
-                ranked = sorted(range(N_E), key=lambda e: R[tE + e], reverse=True)[:top_k]
-                max_r = R[tE + ranked[0]]
-                exps = [math.exp(R[tE + e] - max_r) for e in ranked]
-                sum_e = sum(exps)
-                probs = [ex / sum_e for ex in exps]
-
-                x_row = FlatTensor(1, D, array('d', x_norm2.data[t * D : (t + 1) * D]))
-                tD = t * D
-                for m, e_idx in enumerate(ranked):
-                    ep = f"{p}experts.{e_idx}."
+                    x_row = FlatTensor(1, D, array('d', x_norm2.data[t * D : (t + 1) * D]))
                     gate = x_row.matmul(w[ep + "w_gate"], use_int8=True)
                     up = x_row.matmul(w[ep + "w_up"], use_int8=True)
                     hidden = FlatTensor.swiglu_act(gate, up)
                     exp_out = hidden.matmul(w[ep + "w_down"], use_int8=True).data
-                    prob = probs[m]
+
+                    tD = t * D
                     for d in range(D):
                         out_data[tD + d] += prob * exp_out[d]
-
             moe_out = FlatTensor(T, D, out_data)
         else:
-            expert_outs = []
-            for e in range(self.n_experts):
+            # True sparse token dispatch: each expert evaluates ONLY its routed tokens
+            expert_outputs_map = {}
+            for e, tok_indices in token_indices_per_expert.items():
+                if not tok_indices:
+                    continue
                 ep = f"{p}experts.{e}."
-                gate = x_norm2.matmul(w[ep + "w_gate"], use_int8=False)
-                up = x_norm2.matmul(w[ep + "w_up"], use_int8=False)
-                hidden = FlatTensor.swiglu_act(gate, up)
-                expert_outs.append(hidden.matmul(w[ep + "w_down"], use_int8=False))
-            moe_out = FlatTensor.moe_router_combine(router_logits, expert_outs, top_k=self.moe_top_k)
+                x_e = FlatTensor.embedding(x_norm2, tok_indices)
+                gate_e = x_e.matmul(w[ep + "w_gate"], use_int8=False)
+                up_e = x_e.matmul(w[ep + "w_up"], use_int8=False)
+                hidden_e = FlatTensor.swiglu_act(gate_e, up_e)
+                expert_outputs_map[e] = hidden_e.matmul(w[ep + "w_down"], use_int8=False)
+
+            moe_out = FlatTensor.sparse_moe_combine(
+                router_logits,
+                expert_outputs_map,
+                expert_token_positions,
+                selected_experts,
+                selected_probs,
+                top_k=top_k,
+            )
 
         A, B = self.lora[p + "moe_adapt"]
         if A.requires_grad or any(v != 0.0 for v in B.data):

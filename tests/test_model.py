@@ -5,6 +5,7 @@ import tempfile
 import unittest
 
 from thoughtformula.model import ModernMicroGPT
+from thoughtformula.tensor import FlatTensor
 from thoughtformula.tokenizer import BPETokenizer
 from thoughtformula.rag import PurePythonBM25RAG
 from thoughtformula.draft import NGramDraftModel
@@ -41,6 +42,29 @@ class TestModernMicroGPT(unittest.TestCase):
         logits = self.model.forward(seq, use_int8=False)
         self.assertEqual(logits.rows, 4)
         self.assertEqual(logits.cols, 32)
+
+    def test_forward_sparse_moe_training_grad(self):
+        model = ModernMicroGPT(
+            vocab_size=32,
+            n_embd=16,
+            n_heads=2,
+            n_kv_heads=1,
+            n_layers=1,
+            n_experts=4,
+            moe_top_k=2,
+            expert_hidden=16,
+        )
+        seq = [1, 2, 3]
+        logits = model.forward(seq, use_int8=False)
+        loss = FlatTensor.cross_entropy(logits, [2, 3, 4])
+        loss.backward()
+        router = model.weights["blocks.0.w_router"]
+        self.assertTrue(any(abs(g) > 1e-12 for g in router.grad))
+        expert_grad_sum = sum(
+            sum(abs(g) for g in model.weights[f"blocks.0.experts.{e}.w_down"].grad)
+            for e in range(model.n_experts)
+        )
+        self.assertTrue(expert_grad_sum > 0.0)
 
     def test_forward_int8(self):
         seq = [1, 2, 3]

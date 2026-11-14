@@ -355,6 +355,66 @@ class FlatTensor:
         return out
 
     @staticmethod
+    def sparse_moe_combine(router_logits, expert_outputs_map, expert_token_positions, selected_experts, selected_probs, top_k=2):
+        """
+        Combines sparse expert outputs where each expert only processed its routed tokens.
+        """
+        T, N_E = router_logits.rows, router_logits.cols
+        if not expert_outputs_map:
+            return FlatTensor(T, router_logits.cols)
+        first_out = next(iter(expert_outputs_map.values()))
+        D = first_out.cols
+        out_data = array('d', [0.0] * (T * D))
+
+        for t in range(T):
+            tD = t * D
+            ranked = selected_experts[t]
+            probs = selected_probs[t]
+            for m, e in enumerate(ranked):
+                p = probs[m]
+                pos = expert_token_positions[(t, e)]
+                e_data = expert_outputs_map[e].data
+                posD = pos * D
+                for d in range(D):
+                    out_data[tD + d] += p * e_data[posD + d]
+
+        children = (router_logits,) + tuple(expert_outputs_map.values())
+        out = FlatTensor(T, D, out_data, children)
+
+        def _backward():
+            dOut = out.grad
+            dR = router_logits.grad
+            comp_R = router_logits.requires_grad
+
+            for t in range(T):
+                tD = t * D
+                tE = t * N_E
+                ranked = selected_experts[t]
+                probs = selected_probs[t]
+                c_dots = [0.0] * top_k
+
+                for m, e in enumerate(ranked):
+                    p = probs[m]
+                    pos = expert_token_positions[(t, e)]
+                    exp_t = expert_outputs_map[e]
+                    posD = pos * D
+                    dot_val = 0.0
+                    for d in range(D):
+                        dout_d = dOut[tD + d]
+                        dot_val += dout_d * exp_t.data[posD + d]
+                        if exp_t.requires_grad:
+                            exp_t.grad[posD + d] += p * dout_d
+                    c_dots[m] = dot_val
+
+                if comp_R:
+                    weighted_c = sum(probs[m] * c_dots[m] for m in range(top_k))
+                    for m, e in enumerate(ranked):
+                        dR[tE + e] += probs[m] * (c_dots[m] - weighted_c)
+
+        out._backward = _backward
+        return out
+
+    @staticmethod
     def moe_router_combine(router_logits, expert_outputs, top_k=2):
         """
         Combines outputs from N_E experts using Top-K Softmax routing per token,
