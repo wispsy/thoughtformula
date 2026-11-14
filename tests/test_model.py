@@ -93,6 +93,18 @@ class TestModernMicroGPT(unittest.TestCase):
         self.assertEqual(len(out), 5)
         self.assertEqual(out[:2], prompt)
 
+    def test_speculative_rejection_sampling_nonzero_temp(self):
+        drafter = NGramDraftModel(max_n=3)
+        drafter.fit([[1, 2, 3, 4, 5]])
+        prompt = [1, 2]
+        # Run speculative decoding at non-zero temperature (temp=0.7)
+        out, acc, drf, passes = self.model.generate_speculative(
+            prompt, drafter, max_new_tokens=4, gamma=3, temperature=0.7, use_int8=True
+        )
+        self.assertEqual(len(out), 6)
+        self.assertEqual(out[:2], prompt)
+        self.assertTrue(passes >= 1)
+
     def test_speculative_decoding(self):
         drafter = NGramDraftModel(max_n=3)
         drafter.fit([[1, 2, 3, 4, 5]])

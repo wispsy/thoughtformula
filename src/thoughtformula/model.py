@@ -409,6 +409,40 @@ class ModernMicroGPT:
                     self._adam_update_tensor(param, lr, b1_corr, b2_corr)
 
     @staticmethod
+    def get_probs(logits_row, temperature=0.05, top_k=6, top_p=0.9):
+        V = len(logits_row)
+        if temperature <= 1e-4:
+            probs = [0.0] * V
+            best_idx = max(range(V), key=lambda i: logits_row[i])
+            probs[best_idx] = 1.0
+            return probs
+
+        scaled = [(logits_row[i] / temperature, i) for i in range(V)]
+        scaled.sort(key=lambda x: x[0], reverse=True)
+        if top_k > 0:
+            scaled = scaled[:min(top_k, len(scaled))]
+
+        max_l = scaled[0][0]
+        exps = [math.exp(l - max_l) for l, _ in scaled]
+        total = sum(exps)
+        norm_p = [e / total for e in exps]
+
+        probs = [0.0] * V
+        cum_prob = 0.0
+        active_sum = 0.0
+        for (_, idx), p in zip(scaled, norm_p):
+            probs[idx] = p
+            active_sum += p
+            cum_prob += p
+            if cum_prob >= top_p:
+                break
+
+        if active_sum > 0:
+            for idx in range(V):
+                probs[idx] /= active_sum
+        return probs
+
+    @staticmethod
     def sample_top_k_top_p(logits_row, temperature=0.05, top_k=6, top_p=0.9):
         if temperature <= 1e-4:
             return max(range(len(logits_row)), key=lambda i: logits_row[i])
@@ -491,6 +525,14 @@ class ModernMicroGPT:
         stop_token_id=None,
         use_int8=True,
     ):
+        """
+        Lossless Speculative Decoding (Leviathan et al., 2023):
+        1. Drafts up to gamma tokens with proposal probabilities q(x_i).
+        2. Computes target distribution p(x) in a single Transformer pass.
+        3. Accepts draft token with probability min(1, p(x_i) / q(x_i)).
+        4. On rejection, samples replacement from normalized residual max(0, p(x) - q(x))
+           and rolls back Int8 KV-cache.
+        """
         if not prompt_ids:
             return [], 0, 0, 0
 
@@ -511,11 +553,15 @@ class ModernMicroGPT:
             remaining = max_new_tokens - (len(idx) - prompt_len)
             cur_gamma = min(gamma, max(1, remaining - 1))
 
-            drafted = ngram_drafter.draft(idx, gamma=cur_gamma, stop_token_id=stop_token_id) if cur_gamma > 0 else []
-            K = len(drafted)
+            draft_info = (
+                ngram_drafter.draft_with_probs(idx, gamma=cur_gamma, stop_token_id=stop_token_id)
+                if cur_gamma > 0 and hasattr(ngram_drafter, "draft_with_probs")
+                else [(t, 1.0, {t: 1.0}) for t in (ngram_drafter.draft(idx, gamma=cur_gamma, stop_token_id=stop_token_id) if cur_gamma > 0 else [])]
+            )
+            K = len(draft_info)
             total_drafted += K
 
-            verify_chunk = [idx[-1]] + drafted
+            verify_chunk = [idx[-1]] + [t for t, _, _ in draft_info]
             logits = self.forward(verify_chunk, start_pos=base_len, kv_caches=kv_caches, use_int8=use_int8)
             forward_passes += 1
 
@@ -523,21 +569,38 @@ class ModernMicroGPT:
             hit_eos = False
 
             for i in range(K):
+                draft_tok, q_prob, q_dist = draft_info[i]
                 row = logits.data[i * V : (i + 1) * V]
-                target_tok = self.sample_top_k_top_p(row, temperature, top_k, top_p)
-                draft_tok = drafted[i]
+                p_dist = self.get_probs(row, temperature=temperature, top_k=top_k, top_p=top_p)
 
-                if target_tok == draft_tok:
+                if temperature <= 1e-4:
+                    target_tok = max(range(V), key=lambda v: p_dist[v])
+                    accepted = (target_tok == draft_tok)
+                    replacement_tok = target_tok
+                else:
+                    p_tok = p_dist[draft_tok]
+                    accept_prob = min(1.0, p_tok / max(1e-12, q_prob))
+                    accepted = (random.random() < accept_prob)
+                    if not accepted:
+                        res = [max(0.0, p_dist[v] - q_dist.get(v, 0.0)) for v in range(V)]
+                        res_sum = sum(res)
+                        if res_sum > 1e-12:
+                            norm_res = [r / res_sum for r in res]
+                            replacement_tok = random.choices(range(V), weights=norm_res)[0]
+                        else:
+                            replacement_tok = random.choices(range(V), weights=p_dist)[0]
+
+                if accepted:
                     idx.append(draft_tok)
                     total_accepted += 1
                     if (stop_token_id is not None and draft_tok == stop_token_id) or (len(idx) - prompt_len) >= max_new_tokens:
                         hit_eos = True
                         break
                 else:
-                    idx.append(target_tok)
+                    idx.append(replacement_tok)
                     self.truncate_kv_cache(kv_caches, base_len + 1 + i)
                     all_accepted = False
-                    if stop_token_id is not None and target_tok == stop_token_id:
+                    if stop_token_id is not None and replacement_tok == stop_token_id:
                         hit_eos = True
                     break
 

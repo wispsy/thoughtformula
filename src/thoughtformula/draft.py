@@ -24,23 +24,34 @@ class NGramDraftModel:
                     else:
                         bucket[nxt] = bucket.get(nxt, 0) + 1
 
-    def draft(self, prefix_ids, gamma=4, stop_token_id=None):
-        """Autoregressively drafts up to `gamma` tokens using longest-suffix N-gram match."""
-        drafted = []
+    def draft_with_probs(self, prefix_ids, gamma=4, stop_token_id=None):
+        """
+        Autoregressively drafts up to `gamma` tokens, returning list of:
+        (draft_token_id, q_prob, q_distribution_dict)
+        """
+        results = []
         cur = list(prefix_ids)
         for _ in range(gamma):
-            next_tok = None
+            bucket = None
             for n in range(self.max_n - 1, 0, -1):
                 if len(cur) >= n:
                     ctx = tuple(cur[-n:])
-                    bucket = self.tables[n].get(ctx)
-                    if bucket:
-                        next_tok = max(bucket.items(), key=lambda kv: kv[1])[0]
+                    b = self.tables[n].get(ctx)
+                    if b:
+                        bucket = b
                         break
-            if next_tok is None:
+            if not bucket:
                 break
-            drafted.append(next_tok)
-            cur.append(next_tok)
-            if stop_token_id is not None and next_tok == stop_token_id:
+            total_count = sum(bucket.values())
+            best_tok, best_count = max(bucket.items(), key=lambda kv: kv[1])
+            q_prob = best_count / total_count
+            q_dist = {tok: cnt / total_count for tok, cnt in bucket.items()}
+            results.append((best_tok, q_prob, q_dist))
+            cur.append(best_tok)
+            if stop_token_id is not None and best_tok == stop_token_id:
                 break
-        return drafted
+        return results
+
+    def draft(self, prefix_ids, gamma=4, stop_token_id=None):
+        """Autoregressively drafts up to `gamma` tokens using longest-suffix N-gram match."""
+        return [tok for tok, _, _ in self.draft_with_probs(prefix_ids, gamma=gamma, stop_token_id=stop_token_id)]
