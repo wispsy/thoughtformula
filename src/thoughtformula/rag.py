@@ -1,4 +1,4 @@
-"""Pure-Python Okapi BM25 retriever for RAG."""
+"""Pure-Python Okapi BM25 and Hybrid Dense + Lexical RAG retriever."""
 
 import math
 
@@ -43,7 +43,63 @@ class PurePythonBM25RAG:
                 return
         self.documents.append({"question": q_clean, "fact": f_clean})
 
-    def retrieve(self, query, top_k=1):
+    @staticmethod
+    def compute_dense_embedding(text, model, tokenizer):
+        """Computes mean-pooled, L2-normalized dense sentence embedding from model tok_emb."""
+        raw_ids = tokenizer.encode(text)
+        token_ids = [tid for tid in raw_ids if tid not in getattr(tokenizer, "special_ids", ())]
+        D = model.n_embd
+        if not token_ids:
+            return [0.0] * D
+        tok_data = model.weights["tok_emb"].data
+        vec = [sum(tok_data[tid * D + d] for tid in token_ids) / len(token_ids) for d in range(D)]
+        norm = math.sqrt(sum(v * v for v in vec))
+        if norm > 1e-12:
+            vec = [v / norm for v in vec]
+        return vec
+
+    def retrieve_dense(self, query, model, tokenizer, top_k=None):
+        if not self.documents:
+            return []
+        q_vec = self.compute_dense_embedding(query, model, tokenizer)
+        scored = []
+        for doc in self.documents:
+            d_text = doc["question"] + " " + doc["fact"]
+            d_vec = self.compute_dense_embedding(d_text, model, tokenizer)
+            cos_sim = math.sumprod(q_vec, d_vec)
+            scored.append((doc, cos_sim))
+        scored.sort(key=lambda x: x[1], reverse=True)
+        return scored[:top_k] if top_k is not None else scored
+
+    def retrieve_hybrid(self, query, model, tokenizer, top_k=1, rrf_k=60):
+        """
+        Hybrid Dense + Lexical RAG via Reciprocal Rank Fusion (RRF):
+        RRF_Score(d) = 1 / (rrf_k + rank_bm25(d)) + 1 / (rrf_k + rank_dense(d))
+        Matches exact terms while retrieving semantic synonyms.
+        """
+        if not self.documents:
+            return []
+        bm25_results = self.retrieve(query, top_k=len(self.documents))
+        dense_results = self.retrieve_dense(query, model, tokenizer, top_k=len(self.documents))
+
+        bm25_ranks = {id(doc): rank for rank, (doc, _) in enumerate(bm25_results, 1)}
+        dense_ranks = {id(doc): rank for rank, (doc, _) in enumerate(dense_results, 1)}
+
+        fused = []
+        for doc in self.documents:
+            doc_id = id(doc)
+            r_bm25 = bm25_ranks.get(doc_id, len(self.documents) + 1)
+            r_dense = dense_ranks.get(doc_id, len(self.documents) + 1)
+            rrf_score = (1.0 / (rrf_k + r_bm25)) + (1.0 / (rrf_k + r_dense))
+            fused.append((doc, rrf_score))
+
+        fused.sort(key=lambda x: x[1], reverse=True)
+        return fused[:top_k]
+
+    def retrieve(self, query, top_k=1, model=None, tokenizer=None):
+        if model is not None and tokenizer is not None:
+            return self.retrieve_hybrid(query, model, tokenizer, top_k=top_k)
+
         if not self.documents:
             return []
         q_terms = self.tokenize_terms(query)
@@ -88,3 +144,6 @@ class PurePythonBM25RAG:
         for d in docs:
             rag.add_document(d["question"], d["fact"])
         return rag
+
+
+HybridDenseBM25RAG = PurePythonBM25RAG
