@@ -5,6 +5,8 @@ import json
 import math
 import os
 import random
+import struct
+import zipfile
 
 from .tensor import FlatTensor
 from .tokenizer import BPETokenizer
@@ -650,22 +652,54 @@ class ModernMicroGPT:
 
     def save_checkpoint(self, filepath, tokenizer, rag_engine, corpus_segments):
         self.quantize_all()
+        cfg = {
+            "vocab_size": self.vocab_size,
+            "n_embd": self.n_embd,
+            "n_heads": self.n_heads,
+            "n_kv_heads": self.n_kv_heads,
+            "n_layers": self.n_layers,
+            "n_experts": self.n_experts,
+            "moe_top_k": self.moe_top_k,
+            "expert_hidden": self.expert_hidden,
+            "lora_rank": self.lora_rank,
+            "lora_alpha": self.lora_alpha,
+            "total_steps": self.total_steps,
+            "lora_steps": self.lora_steps,
+            "compression": "binary_mgpt_zlib" if filepath.endswith(".mgpt") else "int8_gqa_moe_lora_zlib_b64",
+        }
+
+        if filepath.endswith(".mgpt"):
+            # Binary .mgpt container using standard zipfile (zero Base64 overhead)
+            manifest = {
+                "config": cfg,
+                "tokenizer": tokenizer.to_dict(),
+                "rag_documents": rag_engine.to_list(),
+                "corpus_segments": corpus_segments,
+                "weights_manifest": {
+                    name: {"rows": t.rows, "cols": t.cols, "scale": t.q_scale}
+                    for name, t in self.weights.items()
+                },
+                "lora_manifest": {
+                    name: {
+                        "A": {"rows": A.rows, "cols": A.cols, "scale": A.q_scale},
+                        "B": {"rows": B.rows, "cols": B.cols, "scale": B.q_scale},
+                    }
+                    for name, (A, B) in self.lora.items()
+                },
+            }
+            with zipfile.ZipFile(filepath, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+                zf.writestr("manifest.json", json.dumps(manifest, separators=(",", ":")))
+                for name, t in self.weights.items():
+                    n = t.rows * t.cols
+                    zf.writestr(f"weights/{name}.bin", struct.pack(f"<{n}b", *t.q_data))
+                for name, (A, B) in self.lora.items():
+                    zf.writestr(f"lora/{name}_A.bin", struct.pack(f"<{A.rows * A.cols}b", *A.q_data))
+                    zf.writestr(f"lora/{name}_B.bin", struct.pack(f"<{B.rows * B.cols}b", *B.q_data))
+            return
+
+        # Legacy JSON + Base64 format
         payload = {
-            "config": {
-                "vocab_size": self.vocab_size,
-                "n_embd": self.n_embd,
-                "n_heads": self.n_heads,
-                "n_kv_heads": self.n_kv_heads,
-                "n_layers": self.n_layers,
-                "n_experts": self.n_experts,
-                "moe_top_k": self.moe_top_k,
-                "expert_hidden": self.expert_hidden,
-                "lora_rank": self.lora_rank,
-                "lora_alpha": self.lora_alpha,
-                "total_steps": self.total_steps,
-                "lora_steps": self.lora_steps,
-                "compression": "int8_gqa_moe_lora_zlib_b64",
-            },
+            "config": cfg,
             "tokenizer": tokenizer.to_dict(),
             "rag_documents": rag_engine.to_list(),
             "corpus_segments": corpus_segments,
@@ -683,6 +717,61 @@ class ModernMicroGPT:
 
     @classmethod
     def load_checkpoint(cls, filepath):
+        if zipfile.is_zipfile(filepath):
+            # Load binary .mgpt container
+            with zipfile.ZipFile(filepath, "r") as zf:
+                manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
+                cfg = manifest["config"]
+                model = cls(
+                    vocab_size=cfg["vocab_size"],
+                    n_embd=cfg.get("n_embd", 24),
+                    n_heads=cfg.get("n_heads", 4),
+                    n_kv_heads=cfg.get("n_kv_heads", 2),
+                    n_layers=cfg.get("n_layers", 2),
+                    n_experts=cfg.get("n_experts", 4),
+                    moe_top_k=cfg.get("moe_top_k", 2),
+                    expert_hidden=cfg.get("expert_hidden", 24),
+                    lora_rank=cfg.get("lora_rank", 4),
+                    lora_alpha=cfg.get("lora_alpha", 8.0),
+                )
+                model.total_steps = cfg.get("total_steps", 0)
+                model.lora_steps = cfg.get("lora_steps", 0)
+
+                for name, meta in manifest.get("weights_manifest", {}).items():
+                    rows, cols, scale = meta["rows"], meta["cols"], float(meta["scale"])
+                    n = rows * cols
+                    raw = zf.read(f"weights/{name}.bin")
+                    q_ints = struct.unpack(f"<{n}b", raw)
+                    t = FlatTensor(rows, cols, array('d', (q * scale for q in q_ints)))
+                    t.q_data = array('b', q_ints)
+                    t.q_scale = scale
+                    model.weights[name] = t
+
+                for name, pair_meta in manifest.get("lora_manifest", {}).items():
+                    meta_a, meta_b = pair_meta["A"], pair_meta["B"]
+                    ra, ca, sa = meta_a["rows"], meta_a["cols"], float(meta_a["scale"])
+                    rb, cb, sb = meta_b["rows"], meta_b["cols"], float(meta_b["scale"])
+                    na, nb = ra * ca, rb * cb
+
+                    raw_a = zf.read(f"lora/{name}_A.bin")
+                    q_a = struct.unpack(f"<{na}b", raw_a)
+                    A = FlatTensor(ra, ca, array('d', (q * sa for q in q_a)))
+                    A.q_data = array('b', q_a)
+                    A.q_scale = sa
+
+                    raw_b = zf.read(f"lora/{name}_B.bin")
+                    q_b = struct.unpack(f"<{nb}b", raw_b)
+                    B = FlatTensor(rb, cb, array('d', (q * sb for q in q_b)))
+                    B.q_data = array('b', q_b)
+                    B.q_scale = sb
+
+                    model.lora[name] = (A, B)
+
+                tokenizer = BPETokenizer.from_dict(manifest["tokenizer"])
+                rag_engine = PurePythonBM25RAG.from_list(manifest.get("rag_documents", []))
+                corpus_segments = manifest.get("corpus_segments", [])
+                return model, tokenizer, rag_engine, corpus_segments, False
+
         with open(filepath, "r", encoding="utf-8") as f:
             payload = json.load(f)
         cfg = payload["config"]

@@ -125,6 +125,28 @@ class TestModernMicroGPT(unittest.TestCase):
         self.assertTrue(len(out) >= 3)
         self.assertEqual(out[:2], prompt)
 
+    def test_binary_mgpt_container_roundtrip(self):
+        tok = BPETokenizer()
+        tok.train("test text")
+        rag = PurePythonBM25RAG()
+        rag.add_document("q", "a")
+        corpus = ["<|context|> a <|user|> q <|assistant|> a <|endoftext|> "]
+
+        with tempfile.NamedTemporaryFile(suffix=".mgpt", delete=False) as f:
+            temp_path = f.name
+
+        try:
+            self.model.save_checkpoint(temp_path, tok, rag, corpus)
+            self.assertTrue(os.path.getsize(temp_path) > 0)
+            loaded_model, l_tok, l_rag, l_corpus, migrated = ModernMicroGPT.load_checkpoint(temp_path)
+            self.assertEqual(loaded_model.vocab_size, self.model.vocab_size)
+            self.assertEqual(len(l_rag.documents), 1)
+            self.assertEqual(l_corpus, corpus)
+            self.assertFalse(migrated)
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
     def test_checkpoint_save_and_load(self):
         tok = BPETokenizer()
         tok.train("test text")

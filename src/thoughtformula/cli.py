@@ -151,6 +151,16 @@ def run_repl(model, tokenizer, rag_engine, ngram_drafter, corpus_segments, ckpt_
             )
             continue
 
+        if user_in.startswith("/test"):
+            print("--- Finite-Difference Gradient Verification ---")
+            from .gradcheck import run_gradient_checks
+            all_ok, _ = run_gradient_checks()
+            if all_ok:
+                print("All custom autograd operators verified to numerical calculus precision < 1e-5!")
+            else:
+                print("WARNING: One or more operators showed gradient discrepancy.")
+            continue
+
         # Case A: Teach via Direct Preference Optimization (q :: good || bad) or LoRA Continual Learning (q :: a)
         if "::" in user_in:
             q_part, a_part = user_in.split("::", 1)

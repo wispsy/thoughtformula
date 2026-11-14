@@ -6,9 +6,10 @@ from .rag import PurePythonBM25RAG, HybridDenseBM25RAG
 from .tokenizer import BPETokenizer
 from .model import ModernMicroGPT
 from .training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn, train_dpo_turn
+from .gradcheck import run_gradient_checks
 from .cli import main
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 __all__ = [
     "FlatTensor",
@@ -21,6 +22,7 @@ __all__ = [
     "build_training_sequences",
     "continual_learn_lora_turn",
     "train_dpo_turn",
+    "run_gradient_checks",
     "main",
     "__version__",
 ]

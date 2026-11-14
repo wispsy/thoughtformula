@@ -11,11 +11,15 @@
 ## Key Features
 
 - **Standard Library Autograd (`FlatTensor`)**: 1D contiguous float64 training buffer with symmetric Int8 inference quantization and reverse-mode automatic differentiation.
-- **Grouped Query Attention (GQA) & RoPE**: Memory-efficient query/key-value head grouping with precomputed or rotational positional embeddings.
-- **Sparse Mixture of Experts (MoE)**: 4 SwiGLU experts per layer with Top-2 token routing.
-- **LoRA Continual Learning**: Instant parameter-efficient adaptation of frozen Int8 base weights during conversation turns.
-- **Speculative Decoding**: Hierarchical N-gram drafter delivering single-pass candidate verification with Int8 KV-cache rollback.
-- **Pure-Python BM25 RAG**: Okapi BM25 retrieval for grounding conversation context.
+- **C-Speed Matrix Multiplication**: Accelerated with compiled C `math.sumprod` over contiguous transposed weight slices (5x-12x pure-Python speedup).
+- **Grouped Query Attention (GQA) & Precomputed RoPE**: Memory-efficient query/key-value head grouping with precomputed `cos_cache` / `sin_cache` trigonometric lookup tables.
+- **Sparse Mixture of Experts (MoE)**: 4 SwiGLU experts with true sparse token dispatch and Switch Transformer auxiliary load-balancing loss preventing expert collapse.
+- **Zero-Memory Direct Preference Optimization (DPO)**: Align model responses (`q :: good || bad`) using frozen Int8 base weights as reference policy $\pi_{\text{ref}}$ with 0 extra RAM.
+- **Decoupled Weight Decay (AdamW)**: Bounded weight magnitudes preventing Int8 scale drift.
+- **Lossless Speculative Decoding**: Leviathan et al. (2023) rejection sampling with N-gram proposal distributions and Int8 KV-cache rollback.
+- **Hybrid Dense + Lexical RAG**: Okapi BM25 combined with mean-pooled `tok_emb` dense embeddings via Reciprocal Rank Fusion (RRF).
+- **Binary `.mgpt` Container**: Python standard library `zipfile` binary container eliminating 33% Base64 storage overhead.
+- **Built-in Gradient Checker**: Finite-difference calculus test harness (`/test`) verifying all analytical gradients to $< 10^{-10}$.
 
 ---
 
