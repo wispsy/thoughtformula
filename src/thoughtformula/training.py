@@ -169,3 +169,78 @@ def train_dpo_turn(
         model.step_adam(lr, lora_only=True, weight_decay=weight_decay)
 
     return last_dpo_loss, last_margin
+
+
+def train_kto_turn(
+    model,
+    tokenizer,
+    question,
+    answer,
+    is_desirable=True,
+    beta=0.1,
+    lr=0.01,
+    epochs=10,
+    weight_decay=0.01,
+    kl_ref=0.0,
+    lambda_u=1.0,
+):
+    """
+    Kahneman-Tversky Optimization (KTO) for unpaired human preference alignment.
+
+    Learns from unpaired binary feedback ('desirable' or 'undesirable' turns)
+    using prospect theory loss and frozen base Int8 weights as reference (zero extra RAM).
+    """
+    prompt = tokenizer.format_rag_prompt(answer, question)
+    p_ids = tokenizer.encode(prompt)
+    prompt_len = len(p_ids)
+
+    seq_text = prompt + answer.strip() + " " + tokenizer.EOS_TOKEN + " "
+    s_ids = tokenizer.encode(seq_text)
+
+    model.set_training_mode(lora_only=True)
+
+    last_kto_loss = 0.0
+    last_reward = 0.0
+
+    for _ in range(epochs):
+        # 1. Reference log-probs with LoRA disabled (frozen base weights, zero extra RAM)
+        ref_log_p, _, _ = model.compute_sequence_log_probs(prompt_len, s_ids, disable_lora=True)
+
+        # 2. Policy log-probs with LoRA enabled
+        pi_log_p, logits, probs = model.compute_sequence_log_probs(prompt_len, s_ids, disable_lora=False)
+
+        # 3. Prospect theory reward margin z = beta * (pi_log - ref_log)
+        reward = beta * (pi_log_p - ref_log_p)
+        last_reward = reward
+        delta = reward - kl_ref
+
+        if is_desirable:
+            # Loss for desirable: -log sigmoid(delta) = log(1 + exp(-delta))
+            delta_clipped = max(-30.0, min(30.0, delta))
+            kto_loss = math.log(1.0 + math.exp(-delta_clipped))
+            sig_neg = 1.0 / (1.0 + math.exp(delta_clipped))
+            grad_scale = beta * sig_neg
+        else:
+            # Loss for undesirable: -log sigmoid(-lambda_u * delta) = log(1 + exp(lambda_u * delta))
+            u = lambda_u * delta
+            u_clipped = max(-30.0, min(30.0, u))
+            kto_loss = math.log(1.0 + math.exp(u_clipped))
+            sig_pos = 1.0 / (1.0 + math.exp(-u_clipped))
+            grad_scale = -beta * lambda_u * sig_pos
+
+        last_kto_loss = kto_loss
+
+        # 4. Analytical policy gradients on response logits
+        V = model.vocab_size
+        for t in range(prompt_len - 1, len(s_ids) - 1):
+            target_token = s_ids[t + 1]
+            p_row = probs[t]
+            tV = t * V
+            for v in range(V):
+                indicator = 1.0 if v == target_token else 0.0
+                logits.grad[tV + v] += grad_scale * (p_row[v] - indicator)
+
+        logits.backward()
+        model.step_adam(lr, lora_only=True, weight_decay=weight_decay)
+
+    return last_kto_loss, last_reward

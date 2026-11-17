@@ -11,7 +11,7 @@ from .tokenizer import BPETokenizer
 from .rag import PurePythonBM25RAG
 from .draft import NGramDraftModel
 from .model import ModernMicroGPT
-from .training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn, train_dpo_turn
+from .training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn, train_dpo_turn, train_kto_turn
 
 
 DEFAULT_KNOWLEDGE = [
@@ -161,9 +161,10 @@ def run_repl(model, tokenizer, rag_engine, ngram_drafter, corpus_segments, ckpt_
                 print("WARNING: One or more operators showed gradient discrepancy.")
             continue
 
-        # Case A: Teach via Direct Preference Optimization (q :: good || bad) or LoRA Continual Learning (q :: a)
+        # Case A: Teach via DPO (q :: good || bad), KTO (q :: a ++ or q :: a --), or LoRA Continual Learning (q :: a)
         if "::" in user_in:
             q_part, a_part = user_in.split("::", 1)
+            a_strip = a_part.strip()
             if "||" in a_part:
                 good_part, bad_part = a_part.split("||", 1)
                 t_dpo = time.perf_counter()
@@ -175,6 +176,22 @@ def run_repl(model, tokenizer, rag_engine, ngram_drafter, corpus_segments, ckpt_
                 file_kb = os.path.getsize(ckpt_path) / 1024.0
                 print(
                     f"[LoRA DPO Adapted in {dt_dpo:.0f} ms | Loss: {dpo_loss:.4f} | Margin: {margin:+.3f} | "
+                    f"Saved '{ckpt_path}' ({file_kb:.1f} KB)]"
+                )
+                user_in = q_part.strip()
+            elif a_strip.endswith("++") or a_strip.endswith("--"):
+                is_desirable = a_strip.endswith("++")
+                ans_text = a_strip[:-2].strip()
+                t_kto = time.perf_counter()
+                kto_loss, reward = train_kto_turn(
+                    model, tokenizer, q_part.strip(), ans_text, is_desirable=is_desirable
+                )
+                dt_kto = (time.perf_counter() - t_kto) * 1000.0
+                model.save_checkpoint(ckpt_path, tokenizer, rag_engine, corpus_segments)
+                file_kb = os.path.getsize(ckpt_path) / 1024.0
+                sign_str = "++ Desirable" if is_desirable else "-- Undesirable"
+                print(
+                    f"[LoRA KTO Adapted ({sign_str}) in {dt_kto:.0f} ms | Loss: {kto_loss:.4f} | Reward: {reward:+.3f} | "
                     f"Saved '{ckpt_path}' ({file_kb:.1f} KB)]"
                 )
                 user_in = q_part.strip()

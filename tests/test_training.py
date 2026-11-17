@@ -1,7 +1,13 @@
 """Unit tests for training utilities and continual learning."""
 
 import unittest
-from thoughtformula.training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn, train_dpo_turn
+from thoughtformula.training import (
+    get_cosine_lr,
+    build_training_sequences,
+    continual_learn_lora_turn,
+    train_dpo_turn,
+    train_kto_turn,
+)
 from thoughtformula.tokenizer import BPETokenizer
 from thoughtformula.model import ModernMicroGPT
 from thoughtformula.rag import PurePythonBM25RAG
@@ -86,6 +92,60 @@ class TestTraining(unittest.TestCase):
             block_size=12,
         )
         self.assertTrue(loss >= 0.0)
+
+    def test_train_kto_turn_desirable(self):
+        tok = BPETokenizer()
+        tok.train("what is this model? deep learning in pure python.", max_merges=6)
+        model = ModernMicroGPT(
+            vocab_size=len(tok.vocab),
+            n_embd=16,
+            n_heads=2,
+            n_kv_heads=1,
+            n_layers=1,
+            n_experts=2,
+            moe_top_k=1,
+            expert_hidden=16,
+            lora_rank=2,
+            lora_alpha=4.0,
+        )
+        kto_loss, reward = train_kto_turn(
+            model,
+            tok,
+            question="what is this model?",
+            answer="deep learning in pure python.",
+            is_desirable=True,
+            beta=0.1,
+            lr=0.01,
+            epochs=3,
+        )
+        self.assertTrue(kto_loss > 0.0)
+
+    def test_train_kto_turn_undesirable(self):
+        tok = BPETokenizer()
+        tok.train("what is this model? bad nonsense.", max_merges=6)
+        model = ModernMicroGPT(
+            vocab_size=len(tok.vocab),
+            n_embd=16,
+            n_heads=2,
+            n_kv_heads=1,
+            n_layers=1,
+            n_experts=2,
+            moe_top_k=1,
+            expert_hidden=16,
+            lora_rank=2,
+            lora_alpha=4.0,
+        )
+        kto_loss, reward = train_kto_turn(
+            model,
+            tok,
+            question="what is this model?",
+            answer="bad nonsense.",
+            is_desirable=False,
+            beta=0.1,
+            lr=0.01,
+            epochs=3,
+        )
+        self.assertTrue(kto_loss > 0.0)
 
 
 if __name__ == "__main__":

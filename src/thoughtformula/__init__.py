@@ -6,7 +6,7 @@ from .rag import PurePythonBM25RAG, HybridDenseBM25RAG
 from .tokenizer import BPETokenizer
 from .model import ModernMicroGPT
 from .cache import PagedKVCache, PagedKVCacheManager, BlockAllocator
-from .training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn, train_dpo_turn
+from .training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn, train_dpo_turn, train_kto_turn
 from .gradcheck import run_gradient_checks
 from .cli import main
 
@@ -26,6 +26,7 @@ __all__ = [
     "build_training_sequences",
     "continual_learn_lora_turn",
     "train_dpo_turn",
+    "train_kto_turn",
     "run_gradient_checks",
     "main",
     "__version__",
