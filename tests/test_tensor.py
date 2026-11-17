@@ -214,6 +214,62 @@ class TestFlatTensor(unittest.TestCase):
         max_fwd_diff = max(abs(a - b) for a, b in zip(out_std.data, out_tile.data))
         self.assertLess(max_fwd_diff, 1e-12)
 
+    def test_bitnet_ternary_quantization_and_bitpacking(self):
+        t = FlatTensor(2, 4, array('d', [2.5, -2.5, 0.05, -0.05, 1.2, -1.2, 0.0, 3.0]))
+        t.quantize_ternary()
+        self.assertIsNotNone(t.t_data)
+        self.assertEqual(len(t.t_data), 8)
+        # All values must be in {-1, 0, 1}
+        for val in t.t_data:
+            self.assertIn(val, (-1, 0, 1))
+
+        # Bitpacked array size should be ceil(8 / 4) = 2 bytes
+        self.assertEqual(len(t.t_packed), 2)
+
+        # Unpack roundtrip
+        unpacked = t.unpack_ternary()
+        self.assertEqual(list(t.t_data), list(unpacked))
+
+        # Serialization roundtrip
+        d = t.to_ternary_compressed_dict()
+        self.assertEqual(d["encoding"], "ternary_zlib_b64")
+        restored = FlatTensor.from_serialized(d)
+        self.assertEqual(list(restored.t_data), list(t.t_data))
+        self.assertAlmostEqual(restored.t_scale, t.t_scale)
+
+    def test_bitnet_addition_only_matmul_forward_and_backward(self):
+        import random
+        random.seed(42)
+        M, K, N = 3, 4, 3
+        a_data = [random.gauss(0.0, 1.0) for _ in range(M * K)]
+        b_data = [random.gauss(0.0, 1.0) for _ in range(K * N)]
+
+        A = FlatTensor(M, K, array('d', a_data), requires_grad=True)
+        B = FlatTensor(K, N, array('d', b_data), requires_grad=True)
+        B.quantize_ternary()
+
+        # Addition-only matmul
+        C_add = A.matmul(B, use_ternary=True)
+
+        # Float matmul using dequantized ternary weights
+        dequant_B = FlatTensor(K, N, array('d', [w * B.t_scale for w in B.t_data]), requires_grad=True)
+        A_float = FlatTensor(M, K, array('d', a_data), requires_grad=True)
+        C_float = A_float.matmul(dequant_B)
+
+        max_diff = max(abs(a - b) for a, b in zip(C_add.data, C_float.data))
+        self.assertLess(max_diff, 1e-12)
+
+        # Backward check
+        grad_out = [1.0] * (M * N)
+        C_add.grad = array('d', grad_out)
+        C_add._backward()
+
+        C_float.grad = array('d', grad_out)
+        C_float._backward()
+
+        max_da_diff = max(abs(a - b) for a, b in zip(A.grad, A_float.grad))
+        self.assertLess(max_da_diff, 1e-12)
+
 
 if __name__ == "__main__":
     unittest.main()

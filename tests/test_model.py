@@ -1,6 +1,7 @@
 """Unit tests for ModernMicroGPT."""
 
 from array import array
+import math
 import os
 import tempfile
 import unittest
@@ -174,6 +175,14 @@ class TestModernMicroGPT(unittest.TestCase):
         logits_flash = self.model.forward(idx_seq, use_flash_attention=True)
         max_diff = max(abs(a - b) for a, b in zip(logits_std.data, logits_flash.data))
         self.assertLess(max_diff, 1e-12)
+
+    def test_forward_bitnet_ternary(self):
+        self.model.quantize_all_ternary()
+        idx_seq = [1, 2, 3, 4]
+        logits = self.model.forward(idx_seq, use_ternary=True)
+        self.assertEqual(logits.rows, 4)
+        self.assertEqual(logits.cols, self.model.vocab_size)
+        self.assertTrue(all(not math.isnan(x) for x in logits.data))
 
 
 if __name__ == "__main__":

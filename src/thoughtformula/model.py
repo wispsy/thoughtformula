@@ -118,9 +118,9 @@ class ModernMicroGPT:
             A.requires_grad = lora_only
             B.requires_grad = lora_only
 
-    def apply_linear_with_lora(self, x, weight_name, use_int8=False, disable_lora=False):
+    def apply_linear_with_lora(self, x, weight_name, use_int8=False, disable_lora=False, use_ternary=False):
         W = self.weights[weight_name]
-        out = x.matmul(W, use_int8=use_int8)
+        out = x.matmul(W, use_int8=use_int8, use_ternary=use_ternary)
         if not disable_lora and weight_name in self.lora:
             A, B = self.lora[weight_name]
             if A.requires_grad or any(v != 0.0 for v in B.data):
@@ -155,6 +155,11 @@ class ModernMicroGPT:
     def quantize_all(self):
         for tensor in self.weights.values():
             tensor.quantize_int8()
+
+    def quantize_all_ternary(self):
+        """BitNet b1.58 ternary quantization across all model base weights."""
+        for tensor in self.weights.values():
+            tensor.quantize_ternary()
 
     def expand_vocab(self, new_tokens_info):
         if not new_tokens_info:
@@ -275,10 +280,10 @@ class ModernMicroGPT:
                 del cache["v_scale"][target_len :]
                 cache["seq_len"] = target_len
 
-    def _forward_moe_block(self, x_norm2, layer_idx, use_int8=False, disable_lora=False):
+    def _forward_moe_block(self, x_norm2, layer_idx, use_int8=False, disable_lora=False, use_ternary=False):
         p = f"blocks.{layer_idx}."
         w = self.weights
-        router_logits = x_norm2.matmul(w[p + "w_router"], use_int8=False)
+        router_logits = x_norm2.matmul(w[p + "w_router"], use_int8=False, use_ternary=use_ternary)
 
         T, D = x_norm2.rows, x_norm2.cols
         N_E = self.n_experts
@@ -306,7 +311,29 @@ class ModernMicroGPT:
                 token_indices_per_expert[e].append(t)
                 expert_token_positions[(t, e)] = pos
 
-        if use_int8:
+        if use_ternary:
+            # BitNet b1.58 addition-only expert evaluation
+            out_data = array('d', [0.0] * (T * D))
+            for e, tok_indices in token_indices_per_expert.items():
+                if not tok_indices:
+                    continue
+                ep = f"{p}experts.{e}."
+                for t in tok_indices:
+                    ranked = selected_experts[t]
+                    m = ranked.index(e)
+                    prob = selected_probs[t][m]
+
+                    x_row = FlatTensor(1, D, array('d', x_norm2.data[t * D : (t + 1) * D]))
+                    gate = x_row.matmul(w[ep + "w_gate"], use_ternary=True)
+                    up = x_row.matmul(w[ep + "w_up"], use_ternary=True)
+                    hidden = FlatTensor.swiglu_act(gate, up)
+                    exp_out = hidden.matmul(w[ep + "w_down"], use_ternary=True).data
+
+                    tD = t * D
+                    for d in range(D):
+                        out_data[tD + d] += prob * exp_out[d]
+            moe_out = FlatTensor(T, D, out_data)
+        elif use_int8:
             out_data = array('d', [0.0] * (T * D))
             for e, tok_indices in token_indices_per_expert.items():
                 if not tok_indices:
@@ -359,7 +386,7 @@ class ModernMicroGPT:
 
         return moe_out
 
-    def forward(self, idx_seq, start_pos=0, kv_caches=None, use_int8=False, disable_lora=False, use_flash_attention=None):
+    def forward(self, idx_seq, start_pos=0, kv_caches=None, use_int8=False, disable_lora=False, use_flash_attention=None, use_ternary=False):
         self.last_aux_loss = 0.0
         w = self.weights
         x = FlatTensor.embedding(w["tok_emb"], idx_seq)
@@ -371,22 +398,22 @@ class ModernMicroGPT:
 
             # 1. Pre-Norm GQA with RoPE + LoRA (supporting FlashAttention online softmax tiling)
             x_norm = x.rmsnorm()
-            Q = self.apply_linear_with_lora(x_norm, p + "wq", use_int8=use_int8, disable_lora=disable_lora)
-            K = x_norm.matmul(w[p + "wk"], use_int8=use_int8)
-            V = self.apply_linear_with_lora(x_norm, p + "wv", use_int8=use_int8, disable_lora=disable_lora)
+            Q = self.apply_linear_with_lora(x_norm, p + "wq", use_int8=use_int8, disable_lora=disable_lora, use_ternary=use_ternary)
+            K = x_norm.matmul(w[p + "wk"], use_int8=use_int8, use_ternary=use_ternary)
+            V = self.apply_linear_with_lora(x_norm, p + "wv", use_int8=use_int8, disable_lora=disable_lora, use_ternary=use_ternary)
             attn_out = FlatTensor.rope_gqa(
                 Q, K, V, self.n_heads, self.n_kv_heads, start_pos=start_pos, kv_cache=layer_cache, rope_cache=self.rope_cache,
                 use_tiling=use_tiling, block_size=self.flash_block_size
             )
-            x = x + self.apply_linear_with_lora(attn_out, p + "wo", use_int8=use_int8, disable_lora=disable_lora)
+            x = x + self.apply_linear_with_lora(attn_out, p + "wo", use_int8=use_int8, disable_lora=disable_lora, use_ternary=use_ternary)
 
             # 2. Pre-Norm Sparse Mixture-of-Experts (MoE) SwiGLU + LoRA
             x_norm2 = x.rmsnorm()
-            moe_out = self._forward_moe_block(x_norm2, l, use_int8=use_int8, disable_lora=disable_lora)
+            moe_out = self._forward_moe_block(x_norm2, l, use_int8=use_int8, disable_lora=disable_lora, use_ternary=use_ternary)
             self.last_aux_loss += getattr(moe_out, "aux_loss", 0.0)
             x = x + moe_out
 
-        logits = self.apply_linear_with_lora(x.rmsnorm(), "lm_head", use_int8=use_int8, disable_lora=disable_lora) + w["b_head"]
+        logits = self.apply_linear_with_lora(x.rmsnorm(), "lm_head", use_int8=use_int8, disable_lora=disable_lora, use_ternary=use_ternary) + w["b_head"]
         return logits
 
     def compute_sequence_log_probs(self, prompt_len, seq_ids, disable_lora=False):

@@ -15,7 +15,8 @@ class FlatTensor:
     """
     __slots__ = (
         'rows', 'cols', 'data', 'grad', '_backward', '_prev',
-        'm', 'v', 'q_data', 'q_scale', 'requires_grad', 'aux_loss'
+        'm', 'v', 'q_data', 'q_scale', 't_data', 't_scale', 't_packed',
+        't_transposed', 'requires_grad', 'aux_loss'
     )
 
     def __init__(self, rows, cols, data=None, _children=(), requires_grad=True):
@@ -30,6 +31,10 @@ class FlatTensor:
         self.v = None
         self.q_data = None
         self.q_scale = 1.0
+        self.t_data = None
+        self.t_scale = 1.0
+        self.t_packed = None
+        self.t_transposed = None
         self.requires_grad = requires_grad
         self.aux_loss = 0.0
 
@@ -89,6 +94,84 @@ class FlatTensor:
             "blob": base64.b64encode(compressed).decode("ascii"),
         }
 
+    def quantize_ternary(self):
+        """BitNet b1.58 ternary quantization {-1, 0, 1} with scale gamma = mean(|W|)."""
+        d = self.data
+        n = len(d)
+        if n == 0:
+            return
+
+        abs_sum = 0.0
+        for x in d:
+            abs_sum += abs(x)
+        gamma = abs_sum / n
+        self.t_scale = gamma
+        inv_gamma = 1.0 / (gamma + 1e-12)
+
+        t_data = array('b', [0] * n)
+        for i in range(n):
+            val = int(round(d[i] * inv_gamma))
+            if val < -1:
+                val = -1
+            elif val > 1:
+                val = 1
+            t_data[i] = val
+        self.t_data = t_data
+
+        # Transposed ternary weights for addition-only matmul
+        R, C = self.rows, self.cols
+        t_T = array('b', [0] * n)
+        for r in range(R):
+            rC = r * C
+            for c in range(C):
+                t_T[c * R + r] = t_data[rC + c]
+        self.t_transposed = t_T
+
+        # Bitpack 4 weights per byte: 0->0, 1->1, -1->2
+        val_to_code = (2, 0, 1)  # offset by +1: -1->2, 0->0, 1->1
+        packed = array('B')
+        for i in range(0, n, 4):
+            byte_val = 0
+            limit = min(4, n - i)
+            for j in range(limit):
+                c = val_to_code[t_data[i + j] + 1]
+                byte_val |= (c << (j * 2))
+            packed.append(byte_val)
+        self.t_packed = packed
+
+    def unpack_ternary(self) -> array:
+        """Unpacks 2-bit packed ternary weights back to array('b') {-1, 0, 1}."""
+        if self.t_packed is None:
+            if self.t_data is None:
+                self.quantize_ternary()
+            return self.t_data
+        n = self.rows * self.cols
+        code_to_val = (0, 1, -1, 0)
+        unpacked = array('b', [0] * n)
+        out_idx = 0
+        for byte_val in self.t_packed:
+            for shift in range(4):
+                if out_idx >= n:
+                    break
+                code = (byte_val >> (shift * 2)) & 3
+                unpacked[out_idx] = code_to_val[code]
+                out_idx += 1
+        return unpacked
+
+    def to_ternary_compressed_dict(self):
+        """Serializes bitpacked ternary weights using zlib and base64."""
+        if self.t_packed is None:
+            self.quantize_ternary()
+        raw_bytes = bytes(self.t_packed)
+        compressed = zlib.compress(raw_bytes, level=9)
+        return {
+            "rows": self.rows,
+            "cols": self.cols,
+            "encoding": "ternary_zlib_b64",
+            "scale": self.t_scale,
+            "blob": base64.b64encode(compressed).decode("ascii"),
+        }
+
     @classmethod
     def from_serialized(cls, obj):
         if isinstance(obj, list):
@@ -109,6 +192,23 @@ class FlatTensor:
             t = cls(rows, cols, array('d', (q * scale for q in q_ints)))
             t.q_data = array('b', q_ints)
             t.q_scale = scale
+            return t
+        elif enc == "ternary_zlib_b64":
+            scale = float(obj["scale"])
+            t = cls(rows, cols)
+            t.t_packed = array('B', raw_bytes)
+            t.t_scale = scale
+            unpacked = t.unpack_ternary()
+            t.t_data = unpacked
+            t.data = array('d', (v * scale for v in unpacked))
+            # Precompute transposed for addition matmul
+            R, C = rows, cols
+            t_T = array('b', [0] * n)
+            for r in range(R):
+                rC = r * C
+                for c in range(C):
+                    t_T[c * R + r] = unpacked[rC + c]
+            t.t_transposed = t_T
             return t
         else:
             floats = struct.unpack(f"<{n}f", raw_bytes)
@@ -187,7 +287,9 @@ class FlatTensor:
             t.q_scale = self.q_scale
         return t
 
-    def matmul(self, other, use_int8=False):
+    def matmul(self, other, use_int8=False, use_ternary=False):
+        if use_ternary:
+            return self.matmul_ternary(other)
         if use_int8:
             return self.matmul_int8(other)
 
@@ -284,6 +386,66 @@ class FlatTensor:
 
         out_data = array('d', (math.sumprod(a_row, b_col) * combined_scale for a_row in A_rows for b_col in B_cols))
         return FlatTensor(M, N, out_data)
+
+    def matmul_ternary(self, other):
+        """BitNet b1.58 addition-only matrix multiplication: self @ other.
+        Replaces multiplications with pure additions and subtractions."""
+        M, K = self.rows, self.cols
+        K2, N = other.rows, other.cols
+        assert K == K2, f"Dimension mismatch: {self.rows}x{K} and {K2}x{N}"
+
+        if other.t_data is None:
+            other.quantize_ternary()
+
+        t_T = other.t_transposed
+        gamma = other.t_scale
+        A = self.data
+        out_data = array('d', [0.0] * (M * N))
+
+        for i in range(M):
+            iK = i * K
+            iN = i * N
+            for j in range(N):
+                jK = j * K
+                acc = 0.0
+                for k in range(K):
+                    w = t_T[jK + k]
+                    if w == 1:
+                        acc += A[iK + k]
+                    elif w == -1:
+                        acc -= A[iK + k]
+                out_data[iN + j] = acc * gamma
+
+        out = FlatTensor(M, N, out_data, (self, other))
+
+        def _backward():
+            dOut = out.grad
+            dA, dB = self.grad, other.grad
+
+            if self.requires_grad:
+                for i in range(M):
+                    iN = i * N
+                    iK = i * K
+                    for k in range(K):
+                        acc = 0.0
+                        for j in range(N):
+                            w = t_T[j * K + k]
+                            if w == 1:
+                                acc += dOut[iN + j]
+                            elif w == -1:
+                                acc -= dOut[iN + j]
+                        dA[iK + k] += acc * gamma
+
+            if other.requires_grad:
+                for k in range(K):
+                    for j in range(N):
+                        acc = 0.0
+                        for i in range(M):
+                            acc += A[i * K + k] * dOut[i * N + j]
+                        dB[k * N + j] += acc
+
+        out._backward = _backward
+        return out
 
     def rmsnorm(self, eps=1e-5):
         T, D = self.rows, self.cols
