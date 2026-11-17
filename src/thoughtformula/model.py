@@ -49,6 +49,7 @@ class ModernMicroGPT:
         self.moe_aux_loss_coeff = moe_aux_loss_coeff
         self.use_flash_attention = use_flash_attention
         self.flash_block_size = flash_block_size
+        self.medusa_drafter = None
         self.total_steps = 0
         self.lora_steps = 0
         self.last_aux_loss = 0.0
@@ -386,7 +387,7 @@ class ModernMicroGPT:
 
         return moe_out
 
-    def forward(self, idx_seq, start_pos=0, kv_caches=None, use_int8=False, disable_lora=False, use_flash_attention=None, use_ternary=False):
+    def forward(self, idx_seq, start_pos=0, kv_caches=None, use_int8=False, disable_lora=False, use_flash_attention=None, use_ternary=False, return_hidden=False):
         self.last_aux_loss = 0.0
         w = self.weights
         x = FlatTensor.embedding(w["tok_emb"], idx_seq)
@@ -413,7 +414,10 @@ class ModernMicroGPT:
             self.last_aux_loss += getattr(moe_out, "aux_loss", 0.0)
             x = x + moe_out
 
-        logits = self.apply_linear_with_lora(x.rmsnorm(), "lm_head", use_int8=use_int8, disable_lora=disable_lora, use_ternary=use_ternary) + w["b_head"]
+        x_norm_final = x.rmsnorm()
+        logits = self.apply_linear_with_lora(x_norm_final, "lm_head", use_int8=use_int8, disable_lora=disable_lora, use_ternary=use_ternary) + w["b_head"]
+        if return_hidden:
+            return logits, x_norm_final
         return logits
 
     def compute_sequence_log_probs(self, prompt_len, seq_ids, disable_lora=False):
@@ -826,6 +830,152 @@ class ModernMicroGPT:
                 idx.append(bonus_tok)
                 yield bonus_tok
                 if stop_token_id is not None and bonus_tok == stop_token_id:
+                    break
+
+    def init_medusa(self, num_heads=3):
+        """Initializes and attaches Medusa multi-head auxiliary speculative drafter."""
+        from .medusa import MedusaDrafter
+        self.medusa_drafter = MedusaDrafter(self.n_embd, self.vocab_size, num_heads=num_heads)
+        return self.medusa_drafter
+
+    def generate_medusa(
+        self,
+        prompt_ids,
+        max_new_tokens=24,
+        temperature=0.05,
+        top_k=6,
+        top_p=0.9,
+        stop_token_id=None,
+        use_int8=True,
+    ):
+        """
+        Medusa multi-head speculative decoding (Cai et al., 2024):
+        Drafts multiple candidate tokens simultaneously from auxiliary prediction heads,
+        then verifies in single base model forward pass.
+        """
+        if self.medusa_drafter is None:
+            self.init_medusa()
+
+        if not prompt_ids:
+            return [], 0, 0, 0
+
+        idx = list(prompt_ids)
+        prompt_len = len(idx)
+        V = self.vocab_size
+        kv_caches = self.init_kv_cache()
+
+        if len(idx) > 1:
+            self.forward(idx[:-1], start_pos=0, kv_caches=kv_caches, use_int8=use_int8)
+
+        total_drafted = 0
+        total_accepted = 0
+        forward_passes = 0
+
+        while (len(idx) - prompt_len) < max_new_tokens:
+            base_len = kv_caches.seq_len if getattr(kv_caches, "is_paged", False) else kv_caches[0]["seq_len"]
+            remaining = max_new_tokens - (len(idx) - prompt_len)
+
+            logits_base, h_last = self.forward([idx[-1]], start_pos=base_len, kv_caches=kv_caches, use_int8=use_int8, return_hidden=True)
+            forward_passes += 1
+            base_tok = self.sample_top_k_top_p(logits_base.data[:V], temperature, top_k, top_p)
+            idx.append(base_tok)
+            if (stop_token_id is not None and base_tok == stop_token_id) or (len(idx) - prompt_len) >= max_new_tokens:
+                break
+
+            cur_heads = min(self.medusa_drafter.num_heads, max(1, remaining - 1))
+            drafted_tokens = []
+            for k in range(cur_heads):
+                head_logits = self.medusa_drafter.heads[k].forward(h_last)
+                head_tok = max(range(V), key=lambda v: head_logits.data[v])
+                drafted_tokens.append(head_tok)
+
+            if not drafted_tokens:
+                continue
+
+            total_drafted += len(drafted_tokens)
+
+            cur_base_len = kv_caches.seq_len if getattr(kv_caches, "is_paged", False) else kv_caches[0]["seq_len"]
+            verify_logits = self.forward(drafted_tokens, start_pos=cur_base_len, kv_caches=kv_caches, use_int8=use_int8)
+            forward_passes += 1
+
+            for i, draft_tok in enumerate(drafted_tokens):
+                row = verify_logits.data[i * V : (i + 1) * V]
+                target_tok = self.sample_top_k_top_p(row, temperature, top_k, top_p)
+                if target_tok == draft_tok:
+                    idx.append(draft_tok)
+                    total_accepted += 1
+                    if (stop_token_id is not None and draft_tok == stop_token_id) or (len(idx) - prompt_len) >= max_new_tokens:
+                        break
+                else:
+                    idx.append(target_tok)
+                    self.truncate_kv_cache(kv_caches, cur_base_len + i + 1)
+                    break
+
+        return idx, total_accepted, total_drafted, forward_passes
+
+    def generate_medusa_stream(
+        self,
+        prompt_ids,
+        max_new_tokens=24,
+        temperature=0.05,
+        top_k=6,
+        top_p=0.9,
+        stop_token_id=None,
+        use_int8=True,
+    ):
+        """Streaming Medusa speculative decoding generator yielding tokens as verified."""
+        if self.medusa_drafter is None:
+            self.init_medusa()
+
+        if not prompt_ids:
+            return
+
+        idx = list(prompt_ids)
+        prompt_len = len(idx)
+        V = self.vocab_size
+        kv_caches = self.init_kv_cache()
+
+        if len(idx) > 1:
+            self.forward(idx[:-1], start_pos=0, kv_caches=kv_caches, use_int8=use_int8)
+
+        while (len(idx) - prompt_len) < max_new_tokens:
+            base_len = kv_caches.seq_len if getattr(kv_caches, "is_paged", False) else kv_caches[0]["seq_len"]
+            remaining = max_new_tokens - (len(idx) - prompt_len)
+
+            logits_base, h_last = self.forward([idx[-1]], start_pos=base_len, kv_caches=kv_caches, use_int8=use_int8, return_hidden=True)
+            base_tok = self.sample_top_k_top_p(logits_base.data[:V], temperature, top_k, top_p)
+            idx.append(base_tok)
+            yield base_tok
+            if (stop_token_id is not None and base_tok == stop_token_id) or (len(idx) - prompt_len) >= max_new_tokens:
+                return
+
+            cur_heads = min(self.medusa_drafter.num_heads, max(1, remaining - 1))
+            drafted_tokens = []
+            for k in range(cur_heads):
+                head_logits = self.medusa_drafter.heads[k].forward(h_last)
+                head_tok = max(range(V), key=lambda v: head_logits.data[v])
+                drafted_tokens.append(head_tok)
+
+            if not drafted_tokens:
+                continue
+
+            cur_base_len = kv_caches.seq_len if getattr(kv_caches, "is_paged", False) else kv_caches[0]["seq_len"]
+            verify_logits = self.forward(drafted_tokens, start_pos=cur_base_len, kv_caches=kv_caches, use_int8=use_int8)
+
+            for i, draft_tok in enumerate(drafted_tokens):
+                row = verify_logits.data[i * V : (i + 1) * V]
+                target_tok = self.sample_top_k_top_p(row, temperature, top_k, top_p)
+                if target_tok == draft_tok:
+                    idx.append(draft_tok)
+                    yield draft_tok
+                    if (stop_token_id is not None and draft_tok == stop_token_id) or (len(idx) - prompt_len) >= max_new_tokens:
+                        return
+                else:
+                    idx.append(target_tok)
+                    yield target_tok
+                    self.truncate_kv_cache(kv_caches, cur_base_len + i + 1)
+                    if stop_token_id is not None and target_tok == stop_token_id:
+                        return
                     break
 
     def save_checkpoint(self, filepath, tokenizer, rag_engine, corpus_segments):
