@@ -35,7 +35,19 @@
 ## Quickstart
 
 ```bash
-# Clone the repository
+# Install via pip
+pip install thoughtformula
+
+# Run CLI directly
+thoughtformula --benchmark
+
+# Or run interactive typewriter REPL
+thoughtformula
+```
+
+### Run from Source
+
+```bash
 git clone https://github.com/wispsy/thoughtformula.git
 cd thoughtformula
 

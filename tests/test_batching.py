@@ -76,11 +76,11 @@ class TestContinuousBatching(unittest.TestCase):
         prompt2 = [4, 5]
 
         # Independent generation
-        ind_tokens1 = self.model.generate(prompt1, max_new_tokens=4, temperature=0.0)[len(prompt1):]
-        ind_tokens2 = self.model.generate(prompt2, max_new_tokens=4, temperature=0.0)[len(prompt2):]
+        ind_tokens1 = self.model.generate(prompt1, max_new_tokens=4, temperature=0.0, use_int8=False)[len(prompt1):]
+        ind_tokens2 = self.model.generate(prompt2, max_new_tokens=4, temperature=0.0, use_int8=False)[len(prompt2):]
 
         # Continuous batching generation
-        scheduler = ContinuousBatchScheduler(self.model, max_batch_size=2, use_paged_cache=False)
+        scheduler = ContinuousBatchScheduler(self.model, max_batch_size=2, use_paged_cache=False, use_int8=False)
         scheduler.add_request(prompt1, request_id="req1", max_new_tokens=4, temperature=0.0)
         scheduler.add_request(prompt2, request_id="req2", max_new_tokens=4, temperature=0.0)
         batched_results = scheduler.run_all()
