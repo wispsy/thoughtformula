@@ -1,16 +1,25 @@
 # Thoughtformula 🧠
 
-> Pure-Python generative Transformer architecture featuring Grouped Query Attention (GQA), Rotary Positional Embeddings (RoPE), Sparse Mixture of Experts (MoE SwiGLU), symmetric Int8 quantization, parameter-efficient LoRA continual learning, and speculative decoding. Built exclusively with Python standard library built-ins.
+> Pure-Python generative Transformer architecture featuring FlashAttention online softmax tiling, vLLM-style Paged KV-Cache, BitNet b1.58 ternary quantization, Grouped Query Attention (GQA), Rotary Positional Embeddings (RoPE), Sparse Mixture of Experts (MoE SwiGLU), LoRA continual learning, Kahneman-Tversky Optimization (KTO), Medusa speculative decoding, persistent binary index (.tfidx), and continuous batching. Built exclusively with Python standard library built-ins.
 
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)]()
 [![Python](https://img.shields.io/badge/python-3.12%2B%20%7C%203.14%2B-blue.svg)]()
 [![Dependencies](https://img.shields.io/badge/dependencies-0%20(stdlib%20only)-success.svg)]()
+[![Version](https://img.shields.io/badge/version-0.3.0-orange.svg)]()
 
 ---
 
 ## Key Features
 
-- **Standard Library Autograd (`FlatTensor`)**: 1D contiguous float64 training buffer with symmetric Int8 inference quantization and reverse-mode automatic differentiation.
+- **Standard Library Autograd (`FlatTensor`)**: 1D contiguous float64 training buffer with symmetric Int8 inference quantization, BitNet b1.58 ternary quantization, and reverse-mode automatic differentiation.
+- **FlashAttention Online Softmax Tiling**: Dao et al. streaming online softmax eliminates $T \times T$ attention matrix materialization, maintaining $O(N)$ memory across long context windows.
+- **vLLM-Style Paged KV-Cache (`PagedKVCache`)**: Fixed-size physical memory pages (e.g., 16 tokens/block), block allocator, and page tables supporting non-contiguous allocation and $O(1)$ prompt prefix sharing.
+- **BitNet b1.58 Ternary Quantization**: Weights in $\{-1, 0, 1\}$ with scale $\gamma = \text{mean}(|W|)$, 2-bit bitpacking (4 weights/byte), and addition-only matrix multiplication.
+- **Kahneman-Tversky Optimization (KTO)**: Unpaired binary human preference alignment (`q :: a ++` and `q :: a --`) using prospect theory utility loss and frozen base Int8 weights as reference.
+- **Interactive Streaming Token Generator**: Real-time typewriter output streaming via `generate_stream()`, `generate_speculative_stream()`, and `generate_medusa_stream()`.
+- **Medusa Multi-Head Speculative Drafter**: Lightweight auxiliary heads predicting multiple future tokens simultaneously directly from the final hidden state without extra transformer layers.
+- **Persistent Binary Index Format (`.tfidx`)**: High-performance binary container persisting precomputed dense embeddings and term inverted postings for large-scale hybrid RAG retrieval.
+- **Continuous Batching Engine (`ContinuousBatchScheduler`)**: Synchronous iteration-level continuous batcher packing active requests into unified forward passes, amortizing parameter loading across concurrent sessions.
 - **C-Speed Matrix Multiplication**: Accelerated with compiled C `math.sumprod` over contiguous transposed weight slices (5x-12x pure-Python speedup).
 - **Grouped Query Attention (GQA) & Precomputed RoPE**: Memory-efficient query/key-value head grouping with precomputed `cos_cache` / `sin_cache` trigonometric lookup tables.
 - **Sparse Mixture of Experts (MoE)**: 4 SwiGLU experts with true sparse token dispatch and Switch Transformer auxiliary load-balancing loss preventing expert collapse.
@@ -33,9 +42,22 @@ cd thoughtformula
 # Run speculative decoding benchmark
 PYTHONPATH=src python3 -m thoughtformula.cli --benchmark
 
-# Run interactive REPL
+# Run interactive typewriter REPL
 PYTHONPATH=src python3 -m thoughtformula.cli
 ```
+
+### REPL Commands & Syntax
+
+| Syntax | Action |
+|---|---|
+| `question?` | RAG retrieval + speculative decoding typewriter output |
+| `q :: answer` | Continual online LoRA adaptation |
+| `q :: good \|\| bad` | Zero-Memory LoRA Direct Preference Optimization (DPO) |
+| `q :: answer ++` | Kahneman-Tversky Optimization (KTO) Desirable feedback |
+| `q :: answer --` | Kahneman-Tversky Optimization (KTO) Undesirable feedback |
+| `/test` | Run finite-difference calculus gradient verification |
+| `/merge` | Merge LoRA adapters into base weights |
+| `/stats` | Display model parameter count and cache metrics |
 
 ---
 
@@ -52,8 +74,12 @@ thoughtformula/
 ├── src/
 │   └── thoughtformula/
 │       ├── __init__.py
+│       ├── batching.py
+│       ├── cache.py
 │       ├── cli.py
 │       ├── draft.py
+│       ├── gradcheck.py
+│       ├── medusa.py
 │       ├── micro_gpt_checkpoint.json
 │       ├── micro_gpt_v8.py
 │       ├── model.py
@@ -62,7 +88,11 @@ thoughtformula/
 │       ├── tokenizer.py
 │       └── training.py
 └── tests/
+    ├── test_batching.py
+    ├── test_cache.py
     ├── test_draft.py
+    ├── test_gradcheck.py
+    ├── test_medusa.py
     ├── test_model.py
     ├── test_rag.py
     ├── test_tensor.py
@@ -74,7 +104,7 @@ thoughtformula/
 
 ## Running Tests
 
-All unit tests run using Python's built-in `unittest` framework:
+All 64 unit tests run using Python's built-in `unittest` framework with zero external dependencies:
 
 ```bash
 PYTHONPATH=src python3 -m unittest discover tests

@@ -1,7 +1,7 @@
 [project]
 name = "thoughtformula"
-version = "0.2.0"
-description = "Pure-Python generative Transformer architecture with GQA, MoE SwiGLU, Int8 quantization, LoRA, and Speculative Decoding"
+version = "0.3.0"
+description = "Pure-Python generative Transformer architecture with FlashAttention, Paged KV-Cache, BitNet b1.58, KTO, Medusa, and Continuous Batching"
 readme = "README.md"
 authors = [
     { name = "ellainng", email = "299958882+ellainng@users.noreply.github.com" }
