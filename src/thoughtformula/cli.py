@@ -221,8 +221,11 @@ def run_repl(model, tokenizer, rag_engine, ngram_drafter, corpus_segments, ckpt_
         prompt_str = tokenizer.format_rag_prompt(fact, grounded_q)
         p_ids = tokenizer.encode(prompt_str)
 
+        sys.stdout.write("Assistant > ")
+        sys.stdout.flush()
         t0 = time.perf_counter()
-        out_ids, acc, drf, passes = model.generate_speculative(
+        reply_ids = []
+        for tok_id in model.generate_speculative_stream(
             p_ids,
             ngram_drafter,
             max_new_tokens=24,
@@ -232,14 +235,16 @@ def run_repl(model, tokenizer, rag_engine, ngram_drafter, corpus_segments, ckpt_
             top_p=top_p,
             stop_token_id=tokenizer.eos_id,
             use_int8=True,
-        )
+        ):
+            if tok_id == tokenizer.eos_id:
+                break
+            tok_str = tokenizer.decode([tok_id], skip_special=True)
+            sys.stdout.write(tok_str)
+            sys.stdout.flush()
+            reply_ids.append(tok_id)
         dt_gen = (time.perf_counter() - t0) * 1000.0
-        reply_ids = out_ids[len(p_ids):]
-        reply_text = tokenizer.decode(reply_ids, skip_special=True).strip()
-        print(
-            f"  [BM25 score={bm25_score:.2f} | Speculative: {acc}/{drf} drafts accepted in {passes} passes ({dt_gen:.1f} ms)]\n"
-            f"Assistant > {reply_text}"
-        )
+        sys.stdout.write(f"\n  [BM25 score={bm25_score:.2f} | Streamed {len(reply_ids)} tokens in {dt_gen:.1f} ms]\n")
+        sys.stdout.flush()
 
 
 def main():

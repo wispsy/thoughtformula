@@ -184,6 +184,28 @@ class TestModernMicroGPT(unittest.TestCase):
         self.assertEqual(logits.cols, self.model.vocab_size)
         self.assertTrue(all(not math.isnan(x) for x in logits.data))
 
+    def test_generate_stream(self):
+        prompt = [1, 2, 3]
+        streamed = list(self.model.generate_stream(prompt, max_new_tokens=5, temperature=0.0))
+        self.assertEqual(len(streamed), 5)
+        self.assertTrue(all(isinstance(t, int) for t in streamed))
+
+    def test_generate_speculative_stream(self):
+        drafter = NGramDraftModel(max_n=4)
+        drafter.fit([[1, 2, 3, 4, 5, 6, 7]])
+        prompt = [1, 2, 3]
+        streamed = list(
+            self.model.generate_speculative_stream(
+                prompt,
+                drafter,
+                max_new_tokens=4,
+                gamma=2,
+                temperature=0.0,
+            )
+        )
+        self.assertEqual(len(streamed), 4)
+        self.assertTrue(all(isinstance(t, int) for t in streamed))
+
 
 if __name__ == "__main__":
     unittest.main()

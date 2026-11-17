@@ -571,7 +571,7 @@ class ModernMicroGPT:
                 return idx
 
             for _ in range(max_new_tokens - 1):
-                cur_pos = kv_caches[0]["seq_len"]
+                cur_pos = kv_caches.seq_len if getattr(kv_caches, "is_paged", False) else kv_caches[0]["seq_len"]
                 logits = self.forward([idx[-1]], start_pos=cur_pos, kv_caches=kv_caches, use_int8=use_int8)
                 last_row = logits.data[0 : V]
                 next_id = self.sample_top_k_top_p(last_row, temperature, top_k, top_p)
@@ -588,6 +588,52 @@ class ModernMicroGPT:
                     break
 
         return idx
+
+    def generate_stream(
+        self,
+        prompt_ids,
+        max_new_tokens=24,
+        temperature=0.05,
+        top_k=6,
+        top_p=0.9,
+        stop_token_id=None,
+        use_kv_cache=True,
+        use_int8=True,
+    ):
+        """Streaming generator yielding generated token IDs one by one."""
+        if not prompt_ids:
+            return
+        idx = list(prompt_ids)
+        V = self.vocab_size
+
+        if use_kv_cache:
+            kv_caches = self.init_kv_cache()
+            logits = self.forward(idx, start_pos=0, kv_caches=kv_caches, use_int8=use_int8)
+            last_row = logits.data[(logits.rows - 1) * V : logits.rows * V]
+            next_id = self.sample_top_k_top_p(last_row, temperature, top_k, top_p)
+            idx.append(next_id)
+            yield next_id
+            if stop_token_id is not None and next_id == stop_token_id:
+                return
+
+            for _ in range(max_new_tokens - 1):
+                cur_pos = kv_caches.seq_len if getattr(kv_caches, "is_paged", False) else kv_caches[0]["seq_len"]
+                logits = self.forward([idx[-1]], start_pos=cur_pos, kv_caches=kv_caches, use_int8=use_int8)
+                last_row = logits.data[0 : V]
+                next_id = self.sample_top_k_top_p(last_row, temperature, top_k, top_p)
+                idx.append(next_id)
+                yield next_id
+                if stop_token_id is not None and next_id == stop_token_id:
+                    return
+        else:
+            for _ in range(max_new_tokens):
+                logits = self.forward(idx, start_pos=0, kv_caches=None, use_int8=use_int8)
+                last_row = logits.data[(logits.rows - 1) * V : logits.rows * V]
+                next_id = self.sample_top_k_top_p(last_row, temperature, top_k, top_p)
+                idx.append(next_id)
+                yield next_id
+                if stop_token_id is not None and next_id == stop_token_id:
+                    return
 
     def generate_speculative(
         self,
@@ -691,6 +737,96 @@ class ModernMicroGPT:
                     break
 
         return idx, total_accepted, total_drafted, forward_passes
+
+    def generate_speculative_stream(
+        self,
+        prompt_ids,
+        ngram_drafter,
+        max_new_tokens=24,
+        gamma=4,
+        temperature=0.05,
+        top_k=6,
+        top_p=0.9,
+        stop_token_id=None,
+        use_int8=True,
+    ):
+        """Streaming speculative decoding generator yielding tokens as verified/accepted."""
+        if not prompt_ids:
+            return
+
+        idx = list(prompt_ids)
+        prompt_len = len(idx)
+        V = self.vocab_size
+        kv_caches = self.init_kv_cache()
+
+        if len(idx) > 1:
+            self.forward(idx[:-1], start_pos=0, kv_caches=kv_caches, use_int8=use_int8)
+
+        while (len(idx) - prompt_len) < max_new_tokens:
+            base_len = kv_caches.seq_len if getattr(kv_caches, "is_paged", False) else kv_caches[0]["seq_len"]
+            remaining = max_new_tokens - (len(idx) - prompt_len)
+            cur_gamma = min(gamma, max(1, remaining - 1))
+
+            draft_info = (
+                ngram_drafter.draft_with_probs(idx, gamma=cur_gamma, stop_token_id=stop_token_id)
+                if cur_gamma > 0 and hasattr(ngram_drafter, "draft_with_probs")
+                else [(t, 1.0, {t: 1.0}) for t in (ngram_drafter.draft(idx, gamma=cur_gamma, stop_token_id=stop_token_id) if cur_gamma > 0 else [])]
+            )
+            K = len(draft_info)
+
+            verify_chunk = [idx[-1]] + [t for t, _, _ in draft_info]
+            logits = self.forward(verify_chunk, start_pos=base_len, kv_caches=kv_caches, use_int8=use_int8)
+
+            all_accepted = True
+            hit_eos = False
+
+            for i in range(K):
+                draft_tok, q_prob, q_dist = draft_info[i]
+                row = logits.data[i * V : (i + 1) * V]
+                p_dist = self.get_probs(row, temperature=temperature, top_k=top_k, top_p=top_p)
+
+                if temperature <= 1e-4:
+                    target_tok = max(range(V), key=lambda v: p_dist[v])
+                    accepted = (target_tok == draft_tok)
+                    replacement_tok = target_tok
+                else:
+                    p_tok = p_dist[draft_tok]
+                    accept_prob = min(1.0, p_tok / max(1e-12, q_prob))
+                    accepted = (random.random() < accept_prob)
+                    if not accepted:
+                        res = [max(0.0, p_dist[v] - q_dist.get(v, 0.0)) for v in range(V)]
+                        res_sum = sum(res)
+                        if res_sum > 1e-12:
+                            norm_res = [r / res_sum for r in res]
+                            replacement_tok = random.choices(range(V), weights=norm_res)[0]
+                        else:
+                            replacement_tok = random.choices(range(V), weights=p_dist)[0]
+
+                if accepted:
+                    idx.append(draft_tok)
+                    yield draft_tok
+                    if (stop_token_id is not None and draft_tok == stop_token_id) or (len(idx) - prompt_len) >= max_new_tokens:
+                        hit_eos = True
+                        break
+                else:
+                    idx.append(replacement_tok)
+                    yield replacement_tok
+                    self.truncate_kv_cache(kv_caches, base_len + 1 + i)
+                    all_accepted = False
+                    if stop_token_id is not None and replacement_tok == stop_token_id:
+                        hit_eos = True
+                    break
+
+            if hit_eos or (len(idx) - prompt_len) >= max_new_tokens:
+                break
+
+            if all_accepted:
+                bonus_row = logits.data[K * V : (K + 1) * V]
+                bonus_tok = self.sample_top_k_top_p(bonus_row, temperature, top_k, top_p)
+                idx.append(bonus_tok)
+                yield bonus_tok
+                if stop_token_id is not None and bonus_tok == stop_token_id:
+                    break
 
     def save_checkpoint(self, filepath, tokenizer, rag_engine, corpus_segments):
         self.quantize_all()
