@@ -420,6 +420,59 @@ class ModernMicroGPT:
             return logits, x_norm_final
         return logits
 
+    def forward_batched(self, token_list, req_caches, start_positions, use_int8=True, disable_lora=False, use_ternary=False):
+        """
+        Batched single-token decode pass for continuous batching:
+        Amortizes linear weight projections across concurrent requests in token_list,
+        dispatching RoPE GQA attention to each request's isolated KV cache.
+        """
+        k = len(token_list)
+        if k == 0:
+            return FlatTensor(0, self.vocab_size)
+
+        D = self.n_embd
+        KV_D = self.kv_dim
+        w = self.weights
+        x = FlatTensor.embedding(w["tok_emb"], token_list)
+
+        for l in range(self.n_layers):
+            p = f"blocks.{l}."
+            x_norm = x.rmsnorm()
+            Q = self.apply_linear_with_lora(x_norm, p + "wq", use_int8=use_int8, disable_lora=disable_lora, use_ternary=use_ternary)
+            K = x_norm.matmul(w[p + "wk"], use_int8=use_int8, use_ternary=use_ternary)
+            V = self.apply_linear_with_lora(x_norm, p + "wv", use_int8=use_int8, disable_lora=disable_lora, use_ternary=use_ternary)
+
+            out_attn = array('d', [0.0] * (k * D))
+            for i in range(k):
+                q_row = FlatTensor(1, D, array('d', Q.data[i * D : (i + 1) * D]))
+                k_row = FlatTensor(1, KV_D, array('d', K.data[i * KV_D : (i + 1) * KV_D]))
+                v_row = FlatTensor(1, KV_D, array('d', V.data[i * KV_D : (i + 1) * KV_D]))
+                layer_cache = req_caches[i][l]
+                row_attn = FlatTensor.rope_gqa(
+                    q_row,
+                    k_row,
+                    v_row,
+                    self.n_heads,
+                    self.n_kv_heads,
+                    start_pos=start_positions[i],
+                    kv_cache=layer_cache,
+                    rope_cache=self.rope_cache,
+                    use_tiling=self.use_flash_attention,
+                    block_size=self.flash_block_size,
+                )
+                base = i * D
+                for d in range(D):
+                    out_attn[base + d] = row_attn.data[d]
+
+            attn_out = FlatTensor(k, D, out_attn)
+            x = x + self.apply_linear_with_lora(attn_out, p + "wo", use_int8=use_int8, disable_lora=disable_lora, use_ternary=use_ternary)
+            x_norm2 = x.rmsnorm()
+            moe_out = self._forward_moe_block(x_norm2, l, use_int8=use_int8, disable_lora=disable_lora, use_ternary=use_ternary)
+            x = x + moe_out
+
+        logits = self.apply_linear_with_lora(x.rmsnorm(), "lm_head", use_int8=use_int8, disable_lora=disable_lora, use_ternary=use_ternary) + w["b_head"]
+        return logits
+
     def compute_sequence_log_probs(self, prompt_len, seq_ids, disable_lora=False):
         """
         Computes total log-probability of target tokens seq_ids[prompt_len:] conditioned on seq_ids[:prompt_len].

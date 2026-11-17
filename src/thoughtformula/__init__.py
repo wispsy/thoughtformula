@@ -7,6 +7,7 @@ from .tokenizer import BPETokenizer
 from .model import ModernMicroGPT
 from .medusa import MedusaDrafter, MedusaHead
 from .cache import PagedKVCache, PagedKVCacheManager, BlockAllocator
+from .batching import ContinuousBatchScheduler, InferenceRequest
 from .training import get_cosine_lr, build_training_sequences, continual_learn_lora_turn, train_dpo_turn, train_kto_turn
 from .gradcheck import run_gradient_checks
 from .cli import main
@@ -25,6 +26,8 @@ __all__ = [
     "PagedKVCache",
     "PagedKVCacheManager",
     "BlockAllocator",
+    "ContinuousBatchScheduler",
+    "InferenceRequest",
     "get_cosine_lr",
     "build_training_sequences",
     "continual_learn_lora_turn",
