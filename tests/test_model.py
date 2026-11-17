@@ -168,6 +168,13 @@ class TestModernMicroGPT(unittest.TestCase):
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
+    def test_forward_flash_attention_equivalence(self):
+        idx_seq = [1, 2, 3, 4, 2]
+        logits_std = self.model.forward(idx_seq, use_flash_attention=False)
+        logits_flash = self.model.forward(idx_seq, use_flash_attention=True)
+        max_diff = max(abs(a - b) for a, b in zip(logits_std.data, logits_flash.data))
+        self.assertLess(max_diff, 1e-12)
+
 
 if __name__ == "__main__":
     unittest.main()

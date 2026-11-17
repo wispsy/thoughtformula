@@ -143,6 +143,77 @@ class TestFlatTensor(unittest.TestCase):
         loss.backward()
         self.assertTrue(abs(logits.grad[0]) < 0.01)
 
+    def test_flash_attention_tiling_forward_and_backward(self):
+        import random
+        T = 8
+        D = 8
+        n_heads = 2
+        n_kv_heads = 1
+        kv_d = D // (n_heads // n_kv_heads)
+
+        random.seed(42)
+        q_raw = [random.gauss(0.0, 0.5) for _ in range(T * D)]
+        k_raw = [random.gauss(0.0, 0.5) for _ in range(T * kv_d)]
+        v_raw = [random.gauss(0.0, 0.5) for _ in range(T * kv_d)]
+        grad_out = [random.gauss(0.0, 0.5) for _ in range(T * D)]
+
+        # Standard non-tiled
+        Q1 = FlatTensor(T, D, array('d', q_raw), requires_grad=True)
+        K1 = FlatTensor(T, kv_d, array('d', k_raw), requires_grad=True)
+        V1 = FlatTensor(T, kv_d, array('d', v_raw), requires_grad=True)
+        out_std = FlatTensor.rope_gqa(Q1, K1, V1, n_heads, n_kv_heads, use_tiling=False)
+        out_std.grad = array('d', grad_out)
+        out_std._backward()
+
+        # Tiled online FlashAttention
+        Q2 = FlatTensor(T, D, array('d', q_raw), requires_grad=True)
+        K2 = FlatTensor(T, kv_d, array('d', k_raw), requires_grad=True)
+        V2 = FlatTensor(T, kv_d, array('d', v_raw), requires_grad=True)
+        out_tile = FlatTensor.rope_gqa(Q2, K2, V2, n_heads, n_kv_heads, use_tiling=True, block_size=3)
+        out_tile.grad = array('d', grad_out)
+        out_tile._backward()
+
+        # Forward equivalence
+        max_fwd_diff = max(abs(a - b) for a, b in zip(out_std.data, out_tile.data))
+        self.assertLess(max_fwd_diff, 1e-12)
+
+        # Backward equivalence
+        max_dq_diff = max(abs(a - b) for a, b in zip(Q1.grad, Q2.grad))
+        max_dk_diff = max(abs(a - b) for a, b in zip(K1.grad, K2.grad))
+        max_dv_diff = max(abs(a - b) for a, b in zip(V1.grad, V2.grad))
+        self.assertLess(max_dq_diff, 1e-12)
+        self.assertLess(max_dk_diff, 1e-12)
+        self.assertLess(max_dv_diff, 1e-12)
+
+    def test_flash_attention_tiling_with_kv_cache(self):
+        import random
+        T = 4
+        D = 8
+        n_heads = 2
+        n_kv_heads = 1
+        kv_d = D // (n_heads // n_kv_heads)
+
+        random.seed(123)
+        q_raw = [random.gauss(0.0, 0.5) for _ in range(T * D)]
+        k_raw = [random.gauss(0.0, 0.5) for _ in range(T * kv_d)]
+        v_raw = [random.gauss(0.0, 0.5) for _ in range(T * kv_d)]
+
+        cache_std = {"k_int8": array('b'), "v_int8": array('b'), "k_scale": array('d'), "v_scale": array('d'), "seq_len": 0}
+        cache_tile = {"k_int8": array('b'), "v_int8": array('b'), "k_scale": array('d'), "v_scale": array('d'), "seq_len": 0}
+
+        Q1 = FlatTensor(T, D, array('d', q_raw))
+        K1 = FlatTensor(T, kv_d, array('d', k_raw))
+        V1 = FlatTensor(T, kv_d, array('d', v_raw))
+        out_std = FlatTensor.rope_gqa(Q1, K1, V1, n_heads, n_kv_heads, kv_cache=cache_std, use_tiling=False)
+
+        Q2 = FlatTensor(T, D, array('d', q_raw))
+        K2 = FlatTensor(T, kv_d, array('d', k_raw))
+        V2 = FlatTensor(T, kv_d, array('d', v_raw))
+        out_tile = FlatTensor.rope_gqa(Q2, K2, V2, n_heads, n_kv_heads, kv_cache=cache_tile, use_tiling=True, block_size=2)
+
+        max_fwd_diff = max(abs(a - b) for a, b in zip(out_std.data, out_tile.data))
+        self.assertLess(max_fwd_diff, 1e-12)
+
 
 if __name__ == "__main__":
     unittest.main()

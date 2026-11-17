@@ -545,7 +545,7 @@ class FlatTensor:
         return out
 
     @staticmethod
-    def rope_gqa(Q, K, V, n_heads, n_kv_heads, start_pos=0, kv_cache=None, rope_cache=None):
+    def rope_gqa(Q, K, V, n_heads, n_kv_heads, start_pos=0, kv_cache=None, rope_cache=None, use_tiling=False, block_size=16):
         T, D = Q.rows, Q.cols
         KV_D = K.cols
         head_dim = D // n_heads
@@ -607,7 +607,6 @@ class FlatTensor:
                         K_rot[base_k + 1] = k0 * s + k1 * c
 
         out_data = array('d', [0.0] * (T * D))
-        probs_store = []
 
         if kv_cache is not None:
             k_int8_buf = kv_cache["k_int8"]
@@ -639,37 +638,198 @@ class FlatTensor:
                     v_int8_buf.append(max(-127, min(127, int(round(Vd[tKV + i] * inv_sv)))))
                 kv_cache["seq_len"] += 1
 
+            if use_tiling:
+                # Online softmax tiling for KV-cache inference (Dao et al. FlashAttention streaming)
+                for h in range(n_heads):
+                    kv_h = h // group_size
+                    h_offset = h * head_dim
+                    kv_offset = kv_h * head_dim
+
+                    for t in range(T):
+                        max_k_pos = start_pos + t + 1
+                        q_base = t * D + h_offset
+                        out_base = t * D + h_offset
+                        m = -float('inf')
+                        l = 0.0
+                        o = [0.0] * head_dim
+
+                        for b_start in range(0, max_k_pos, block_size):
+                            b_end = min(b_start + block_size, max_k_pos)
+                            b_len = b_end - b_start
+                            scores = [0.0] * b_len
+                            for idx, k in enumerate(range(b_start, b_end)):
+                                k_base = k * KV_D + kv_offset
+                                dot_qk = 0.0
+                                for d in range(head_dim):
+                                    dot_qk += Q_rot[q_base + d] * k_int8_buf[k_base + d]
+                                scores[idx] = dot_qk * (k_scales[k] * scale)
+
+                            m_b = max(scores)
+                            m_new = max(m, m_b)
+                            alpha = math.exp(m - m_new) if m != -float('inf') else 0.0
+                            l *= alpha
+                            for d in range(head_dim):
+                                o[d] *= alpha
+                            for idx, k in enumerate(range(b_start, b_end)):
+                                w = math.exp(scores[idx] - m_new)
+                                l += w
+                                v_base = k * KV_D + kv_offset
+                                weighted_scale = w * v_scales[k]
+                                for d in range(head_dim):
+                                    o[d] += weighted_scale * v_int8_buf[v_base + d]
+                            m = m_new
+
+                        inv_l = 1.0 / l if l > 0 else 0.0
+                        for d in range(head_dim):
+                            out_data[out_base + d] = o[d] * inv_l
+            else:
+                for h in range(n_heads):
+                    kv_h = h // group_size
+                    h_offset = h * head_dim
+                    kv_offset = kv_h * head_dim
+
+                    for t in range(T):
+                        max_k_pos = start_pos + t + 1
+                        q_base = t * D + h_offset
+                        scores = [0.0] * max_k_pos
+
+                        for k in range(max_k_pos):
+                            k_base = k * KV_D + kv_offset
+                            dot_qk = 0.0
+                            for d in range(head_dim):
+                                dot_qk += Q_rot[q_base + d] * k_int8_buf[k_base + d]
+                            scores[k] = dot_qk * (k_scales[k] * scale)
+
+                        max_s = max(scores)
+                        exps = [math.exp(s - max_s) for s in scores]
+                        sum_e = sum(exps)
+                        probs = [e / sum_e for e in exps]
+
+                        out_base = t * D + h_offset
+                        for k, p in enumerate(probs):
+                            v_base = k * KV_D + kv_offset
+                            weighted_scale = p * v_scales[k]
+                            for d in range(head_dim):
+                                out_data[out_base + d] += weighted_scale * v_int8_buf[v_base + d]
+
+            return FlatTensor(T, D, out_data)
+
+        if use_tiling:
+            # FlashAttention online softmax tiling (Dao et al. 2022) with O(N) memory
+            m_stats = array('d', [0.0] * (n_heads * T))
+            l_stats = array('d', [0.0] * (n_heads * T))
+
             for h in range(n_heads):
                 kv_h = h // group_size
                 h_offset = h * head_dim
                 kv_offset = kv_h * head_dim
 
                 for t in range(T):
-                    max_k_pos = start_pos + t + 1
+                    max_k_pos = t + 1
                     q_base = t * D + h_offset
-                    scores = [0.0] * max_k_pos
+                    out_base = q_base
+                    m = -float('inf')
+                    l = 0.0
+                    o = [0.0] * head_dim
 
-                    for k in range(max_k_pos):
-                        k_base = k * KV_D + kv_offset
-                        dot_qk = 0.0
+                    for b_start in range(0, max_k_pos, block_size):
+                        b_end = min(b_start + block_size, max_k_pos)
+                        b_len = b_end - b_start
+                        scores = [0.0] * b_len
+                        for idx, k in enumerate(range(b_start, b_end)):
+                            k_base = k * KV_D + kv_offset
+                            s_val = 0.0
+                            for d in range(head_dim):
+                                s_val += Q_rot[q_base + d] * K_rot[k_base + d]
+                            scores[idx] = s_val * scale
+
+                        m_b = max(scores)
+                        m_new = max(m, m_b)
+                        alpha = math.exp(m - m_new) if m != -float('inf') else 0.0
+                        l *= alpha
                         for d in range(head_dim):
-                            dot_qk += Q_rot[q_base + d] * k_int8_buf[k_base + d]
-                        scores[k] = dot_qk * (k_scales[k] * scale)
+                            o[d] *= alpha
+                        for idx, k in enumerate(range(b_start, b_end)):
+                            w = math.exp(scores[idx] - m_new)
+                            l += w
+                            v_base = k * KV_D + kv_offset
+                            for d in range(head_dim):
+                                o[d] += w * Vd[v_base + d]
+                        m = m_new
 
-                    max_s = max(scores)
-                    exps = [math.exp(s - max_s) for s in scores]
-                    sum_e = sum(exps)
-                    probs = [e / sum_e for e in exps]
+                    inv_l = 1.0 / l if l > 0 else 0.0
+                    for d in range(head_dim):
+                        out_data[out_base + d] = o[d] * inv_l
+                    ht_idx = h * T + t
+                    m_stats[ht_idx] = m
+                    l_stats[ht_idx] = l
 
-                    out_base = t * D + h_offset
-                    for k, p in enumerate(probs):
-                        v_base = k * KV_D + kv_offset
-                        weighted_scale = p * v_scales[k]
+            out = FlatTensor(T, D, out_data, (Q, K, V))
+
+            def _backward():
+                dOut, dV = out.grad, V.grad
+                dQ_rot = array('d', [0.0] * (T * D))
+                dK_rot = array('d', [0.0] * (T * KV_D))
+
+                for h in range(n_heads):
+                    kv_h = h // group_size
+                    h_offset = h * head_dim
+                    kv_offset = kv_h * head_dim
+
+                    for t in range(T):
+                        max_k_pos = t + 1
+                        q_base = t * D + h_offset
+                        out_base = q_base
+                        ht_idx = h * T + t
+                        m = m_stats[ht_idx]
+                        l = l_stats[ht_idx]
+
+                        # D_t = sum_d (dOut[t, d] * out[t, d]) eliminates full matrix backward
+                        D_t = 0.0
                         for d in range(head_dim):
-                            out_data[out_base + d] += weighted_scale * v_int8_buf[v_base + d]
+                            D_t += dOut[out_base + d] * out_data[out_base + d]
 
-            return FlatTensor(T, D, out_data)
+                        for b_start in range(0, max_k_pos, block_size):
+                            b_end = min(b_start + block_size, max_k_pos)
+                            for k in range(b_start, b_end):
+                                k_base = k * KV_D + kv_offset
+                                s_val = 0.0
+                                for d in range(head_dim):
+                                    s_val += Q_rot[q_base + d] * K_rot[k_base + d]
+                                s_val *= scale
+                                p_k = math.exp(s_val - m) / l
+                                dp_k = 0.0
+                                for d in range(head_dim):
+                                    dp_k += dOut[out_base + d] * Vd[k_base + d]
+                                ds = p_k * (dp_k - D_t) * scale
+                                for d in range(head_dim):
+                                    dV[k_base + d] += p_k * dOut[out_base + d]
+                                    dQ_rot[q_base + d] += ds * K_rot[k_base + d]
+                                    dK_rot[k_base + d] += ds * Q_rot[q_base + d]
 
+                dQ, dK = Q.grad, K.grad
+                for t in range(T):
+                    tD = t * D
+                    tKV = t * KV_D
+                    t_half = t * half_d
+                    for m_idx in range(half_d):
+                        c = cos_table[t_half + m_idx]
+                        s = sin_table[t_half + m_idx]
+                        for h in range(n_heads):
+                            base_q = tD + h * head_dim + 2 * m_idx
+                            dq0, dq1 = dQ_rot[base_q], dQ_rot[base_q + 1]
+                            dQ[base_q] += dq0 * c + dq1 * s
+                            dQ[base_q + 1] += -dq0 * s + dq1 * c
+                        for kv_h in range(n_kv_heads):
+                            base_k = tKV + kv_h * head_dim + 2 * m_idx
+                            dk0, dk1 = dK_rot[base_k], dK_rot[base_k + 1]
+                            dK[base_k] += dk0 * c + dk1 * s
+                            dK[base_k + 1] += -dk0 * s + dk1 * c
+
+            out._backward = _backward
+            return out
+
+        probs_store = []
         for h in range(n_heads):
             kv_h = h // group_size
             h_offset = h * head_dim

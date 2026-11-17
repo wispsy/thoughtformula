@@ -28,6 +28,8 @@ class ModernMicroGPT:
         lora_rank=4,
         lora_alpha=8.0,
         moe_aux_loss_coeff=0.01,
+        use_flash_attention=False,
+        flash_block_size=16,
     ):
         assert n_embd % n_heads == 0 and (n_embd // n_heads) % 2 == 0
         assert n_heads % n_kv_heads == 0
@@ -45,6 +47,8 @@ class ModernMicroGPT:
         self.lora_alpha = lora_alpha
         self.lora_scale = lora_alpha / max(1, lora_rank)
         self.moe_aux_loss_coeff = moe_aux_loss_coeff
+        self.use_flash_attention = use_flash_attention
+        self.flash_block_size = flash_block_size
         self.total_steps = 0
         self.lora_steps = 0
         self.last_aux_loss = 0.0
@@ -346,22 +350,24 @@ class ModernMicroGPT:
 
         return moe_out
 
-    def forward(self, idx_seq, start_pos=0, kv_caches=None, use_int8=False, disable_lora=False):
+    def forward(self, idx_seq, start_pos=0, kv_caches=None, use_int8=False, disable_lora=False, use_flash_attention=None):
         self.last_aux_loss = 0.0
         w = self.weights
         x = FlatTensor.embedding(w["tok_emb"], idx_seq)
+        use_tiling = self.use_flash_attention if use_flash_attention is None else use_flash_attention
 
         for l in range(self.n_layers):
             p = f"blocks.{l}."
             layer_cache = kv_caches[l] if kv_caches is not None else None
 
-            # 1. Pre-Norm GQA with RoPE + LoRA
+            # 1. Pre-Norm GQA with RoPE + LoRA (supporting FlashAttention online softmax tiling)
             x_norm = x.rmsnorm()
             Q = self.apply_linear_with_lora(x_norm, p + "wq", use_int8=use_int8, disable_lora=disable_lora)
             K = x_norm.matmul(w[p + "wk"], use_int8=use_int8)
             V = self.apply_linear_with_lora(x_norm, p + "wv", use_int8=use_int8, disable_lora=disable_lora)
             attn_out = FlatTensor.rope_gqa(
-                Q, K, V, self.n_heads, self.n_kv_heads, start_pos=start_pos, kv_cache=layer_cache, rope_cache=self.rope_cache
+                Q, K, V, self.n_heads, self.n_kv_heads, start_pos=start_pos, kv_cache=layer_cache, rope_cache=self.rope_cache,
+                use_tiling=use_tiling, block_size=self.flash_block_size
             )
             x = x + self.apply_linear_with_lora(attn_out, p + "wo", use_int8=use_int8, disable_lora=disable_lora)
 
