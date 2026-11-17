@@ -609,6 +609,66 @@ class FlatTensor:
         out_data = array('d', [0.0] * (T * D))
 
         if kv_cache is not None:
+            if getattr(kv_cache, "is_paged", False):
+                # vLLM-style paged KV-cache non-contiguous block allocation
+                for t in range(T):
+                    tKV = t * KV_D
+                    kv_cache.append_token(
+                        K_rot[tKV : tKV + KV_D],
+                        Vd[tKV : tKV + KV_D]
+                    )
+
+                page_size = kv_cache.page_size
+                for h in range(n_heads):
+                    kv_h = h // group_size
+                    h_offset = h * head_dim
+                    kv_offset = kv_h * head_dim
+
+                    for t in range(T):
+                        max_k_pos = start_pos + t + 1
+                        q_base = t * D + h_offset
+                        out_base = t * D + h_offset
+                        m = -float('inf')
+                        l = 0.0
+                        o = [0.0] * head_dim
+
+                        num_pages = (max_k_pos + page_size - 1) // page_size
+                        for p_idx in range(num_pages):
+                            block = kv_cache.get_block(p_idx)
+                            b_start = p_idx * page_size
+                            b_len = min(page_size, max_k_pos - b_start)
+                            if b_len <= 0:
+                                break
+
+                            scores = [0.0] * b_len
+                            for slot in range(b_len):
+                                slot_base = slot * KV_D + kv_offset
+                                dot_qk = 0.0
+                                for d in range(head_dim):
+                                    dot_qk += Q_rot[q_base + d] * block.k_int8[slot_base + d]
+                                scores[slot] = dot_qk * (block.k_scale[slot] * scale)
+
+                            m_b = max(scores)
+                            m_new = max(m, m_b)
+                            alpha = math.exp(m - m_new) if m != -float('inf') else 0.0
+                            l *= alpha
+                            for d in range(head_dim):
+                                o[d] *= alpha
+                            for slot in range(b_len):
+                                w = math.exp(scores[slot] - m_new)
+                                l += w
+                                slot_base = slot * KV_D + kv_offset
+                                weighted_scale = w * block.v_scale[slot]
+                                for d in range(head_dim):
+                                    o[d] += weighted_scale * block.v_int8[slot_base + d]
+                            m = m_new
+
+                        inv_l = 1.0 / l if l > 0 else 0.0
+                        for d in range(head_dim):
+                            out_data[out_base + d] = o[d] * inv_l
+
+                return FlatTensor(T, D, out_data)
+
             k_int8_buf = kv_cache["k_int8"]
             v_int8_buf = kv_cache["v_int8"]
             k_scales = kv_cache["k_scale"]

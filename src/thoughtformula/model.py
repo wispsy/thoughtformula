@@ -244,7 +244,12 @@ class ModernMicroGPT:
         lm_head.quantize_int8()
         b_head.quantize_int8()
 
-    def init_kv_cache(self):
+    def init_kv_cache(self, use_paged=False, page_size=16):
+        if use_paged:
+            from .cache import PagedKVCacheManager
+            if not hasattr(self, "_paged_cache_mgr") or self._paged_cache_mgr is None or self._paged_cache_mgr.page_size != page_size:
+                self._paged_cache_mgr = PagedKVCacheManager(self.n_layers, self.kv_dim, page_size=page_size)
+            return self._paged_cache_mgr.create_cache()
         return [
             {
                 "k_int8": array('b'),
@@ -257,6 +262,10 @@ class ModernMicroGPT:
         ]
 
     def truncate_kv_cache(self, kv_caches, target_len):
+        if getattr(kv_caches, "is_paged", False):
+            kv_caches.truncate(target_len)
+            return
+
         kv_d = self.kv_dim
         for cache in kv_caches:
             if cache["seq_len"] > target_len:
