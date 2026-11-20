@@ -1,6 +1,7 @@
 """Unit tests for finite-difference gradient verification."""
 
 import unittest
+import random
 from thoughtformula.gradcheck import (
     check_rmsnorm_gradient,
     check_swiglu_gradient,
@@ -30,6 +31,16 @@ class TestGradCheck(unittest.TestCase):
         passed, err = check_moe_router_gradient()
         self.assertTrue(passed)
         self.assertTrue(err < 1e-5)
+
+    def test_moe_boundary_fixture_keeps_the_selected_route_stable(self):
+        previous = random.getstate()
+        try:
+            random.seed(5295)
+            passed, error = check_moe_router_gradient()
+        finally:
+            random.setstate(previous)
+        self.assertTrue(passed)
+        self.assertLess(error, 1e-5)
 
     def test_run_all_checks(self):
         all_passed, results = run_gradient_checks()

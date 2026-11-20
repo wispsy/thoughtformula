@@ -110,6 +110,14 @@ def check_rope_gqa_gradient(T=2, D=4, n_heads=2, n_kv_heads=1, eps=1e-5, tol=1e-
 def check_moe_router_gradient(T=2, N_E=4, D=4, eps=1e-5, tol=1e-5):
     """Verifies moe_router_combine analytical backward pass against centered finite differences."""
     r_data = array('d', [random.gauss(0.0, 0.5) for _ in range(T * N_E)])
+    # A finite difference is a local derivative check. Keep its +/- eps
+    # perturbation inside one selected top-k region, away from a discontinuity.
+    if N_E > 2:
+        for t in range(T):
+            ranked = sorted(range(N_E), key=lambda e: r_data[t * N_E + e], reverse=True)
+            second, third = t * N_E + ranked[1], t * N_E + ranked[2]
+            if r_data[second] - r_data[third] <= 4 * eps:
+                r_data[second] += 8 * eps
     exp_outs = [FlatTensor(T, D, array('d', [random.gauss(0.0, 0.5) for _ in range(T * D)])) for _ in range(N_E)]
     grad_out = array('d', [random.gauss(0.0, 0.5) for _ in range(T * D)])
 
