@@ -7,7 +7,7 @@ import zipfile
 import json
 
 from thoughtformula import (BPETokenizer, ModernMicroGPT, TrainingConfig, TrainingState, fit, evaluate,
-                           save_training_checkpoint, load_training_checkpoint, reset_optimizer)
+                           save_training_checkpoint, load_training_checkpoint, reset_optimizer, token_sequences)
 from thoughtformula.pretraining import parameters
 
 
@@ -67,6 +67,14 @@ class PretrainingTests(unittest.TestCase):
             self.assertEqual(list(tensor.data),previous[key])
             self.assertIsNone(tensor.m)
         self.assertEqual(fit(model,pairs,TrainingConfig(max_steps=1,block_size=4)).state.step,1)
+
+    def test_token_windows_preserve_documents_and_refuse_unknown_text(self):
+        model,tokenizer,pairs=initialized()
+        result=token_sequences(tokenizer,['hi','world'],block_size=2)
+        self.assertTrue(all(len(left)==len(right)<=2 for left,right in result))
+        self.assertEqual(result[0][0],tuple(tokenizer.encode('hi')))
+        self.assertEqual(result[0][1][-1],tokenizer.eos_id)
+        with self.assertRaises(ValueError): token_sequences(tokenizer,['🙂'])
 
     def test_config_pairs_and_artifacts_are_bounded(self):
         model,tokenizer,pairs=initialized()

@@ -42,3 +42,7 @@ from .pretraining import TrainingConfig, TrainingState, StepMetric, TrainingResu
 from .training_checkpoint import save_training_checkpoint, load_training_checkpoint
 
 __all__ += ["TrainingConfig", "TrainingState", "StepMetric", "TrainingResult", "fit", "evaluate", "parameter_count", "reset_optimizer", "save_training_checkpoint", "load_training_checkpoint"]
+
+from .pretraining import token_sequences
+from .training_checkpoint import validate_model_config
+__all__ += ["token_sequences", "validate_model_config"]

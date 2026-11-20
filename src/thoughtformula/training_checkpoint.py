@@ -31,7 +31,7 @@ def _decode(raw):
     return json.loads(raw,object_pairs_hook=_pairs,parse_constant=lambda _v: (_ for _ in ()).throw(ValueError('Nonfinite JSON')))
 
 
-def _config(value):
+def validate_model_config(value):
     if type(value) is not dict or set(value)!=set(FIELDS): raise ValueError('Invalid model configuration')
     bounds={'vocab_size':(4,8192),'n_embd':(4,256),'n_heads':(1,32),'n_kv_heads':(1,32),
             'n_layers':(1,8),'n_experts':(1,16),'moe_top_k':(1,16),'expert_hidden':(1,2048),'lora_rank':(1,64),'flash_block_size':(1,256)}
@@ -55,7 +55,7 @@ def save_training_checkpoint(path,model,tokenizer,config,state,*,metadata=None,o
     path=Path(path)
     if type(config) is not TrainingConfig or type(state) is not TrainingState or type(overwrite) is not bool:
         raise TypeError('Select typed training configuration/state and an explicit overwrite flag')
-    architecture=_config({key:getattr(model,key) for key in FIELDS})
+    architecture=validate_model_config({key:getattr(model,key) for key in FIELDS})
     if model.medusa_drafter is not None: raise ValueError('Auxiliary Medusa heads are outside this training artifact profile')
     if tokenizer.vocab and len(tokenizer.vocab)!=model.vocab_size: raise ValueError('Tokenizer vocabulary differs from model')
     counter=model.lora_steps if config.lora_only else model.total_steps
@@ -106,7 +106,7 @@ def load_training_checkpoint(path):
         expected={'format','architecture','context_capacity','config','state','total_steps','lora_steps','tokenizer','tensors','metadata'}
         if type(payload) is not dict or set(payload)!=expected or payload['format']!=FORMAT:
             raise ValueError('Unsupported training artifact')
-        architecture=_config(payload['architecture'])
+        architecture=validate_model_config(payload['architecture'])
         config=TrainingConfig(**payload['config']);state=TrainingState(**payload['state'])
         integer(payload['context_capacity'],'Context capacity',1,256)
         integer(payload['total_steps'],'Full steps',0,1000000);integer(payload['lora_steps'],'LoRA steps',0,1000000)

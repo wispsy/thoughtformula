@@ -156,3 +156,22 @@ def evaluate(model,pairs,*,block_size=256,max_sequences=32):
         for tensor,flag in flags: tensor.requires_grad=flag
     mean=total/tokens
     return {'loss':mean,'perplexity':math.exp(mean),'tokens':tokens,'sequences':len(values)}
+
+
+def token_sequences(tokenizer,documents,*,block_size=32,max_sequences=8192):
+    """Pack strict next-token windows within documents, never across boundaries."""
+    integer(block_size,'Block size',1,256)
+    integer(max_sequences,'Sequence count',1,8192)
+    result=[]
+    for index,text in enumerate(islice(iter(documents),1025)):
+        if index>=1024: raise ValueError('Too many selected documents')
+        if type(text) is not str or len(text)>65536: raise ValueError('Select bounded text documents')
+        ids=tokenizer.encode(text)
+        if tokenizer.decode(ids)!=text: raise ValueError('Text is not exactly representable by the selected tokenizer')
+        ids.append(tokenizer.eos_id)
+        for offset in range(0,len(ids)-1,block_size):
+            chunk=ids[offset:offset+block_size+1]
+            if len(chunk)>1: result.append((tuple(chunk[:-1]),tuple(chunk[1:])))
+            if len(result)>=max_sequences: return tuple(result)
+    if not result: raise ValueError('No nonempty token sequences')
+    return tuple(result)
