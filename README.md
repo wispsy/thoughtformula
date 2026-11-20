@@ -127,3 +127,13 @@ PYTHONPATH=src python3 -m unittest discover tests
 ## License
 
 MIT
+
+
+## Generation request limits
+
+All standard, speculative and Medusa generation methods accept nonnegative integer
+token budgets, reject invalid vocabulary IDs, and require prompt plus output
+budget within `model.max_seq_len`. Zero budget preserves the prompt in nonstream
+results and yields nothing in streams, without cache allocation, Medusa setup or
+a forward pass. Empty prompts retain their existing empty return shapes. Sampling
+and return shapes otherwise remain compatible.
