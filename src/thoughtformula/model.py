@@ -2,6 +2,7 @@
 
 from array import array
 import json
+from itertools import islice
 import math
 import os
 import random
@@ -602,6 +603,18 @@ class ModernMicroGPT:
 
         return random.choices(filtered_indices, weights=filtered_probs)[0]
 
+    def _generation_input(self, prompt_ids, max_new_tokens):
+        """Validate finite token requests before allocating caches or forwarding."""
+        if type(max_new_tokens) is not int or max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be a nonnegative integer")
+        capacity = self.max_seq_len
+        prompt = list(islice(iter(prompt_ids), capacity + 1))
+        if len(prompt) + max_new_tokens > capacity:
+            raise ValueError("Prompt plus generation budget exceeds context capacity")
+        if any(type(token) is not int or not 0 <= token < self.vocab_size for token in prompt):
+            raise ValueError("Prompt token IDs are outside the model vocabulary")
+        return prompt
+
     def generate(
         self,
         prompt_ids,
@@ -613,8 +626,9 @@ class ModernMicroGPT:
         use_kv_cache=True,
         use_int8=True,
     ):
-        if not prompt_ids:
-            return []
+        prompt_ids = self._generation_input(prompt_ids, max_new_tokens)
+        if not prompt_ids or max_new_tokens == 0:
+            return prompt_ids
         idx = list(prompt_ids)
         V = self.vocab_size
 
@@ -658,7 +672,8 @@ class ModernMicroGPT:
         use_int8=True,
     ):
         """Streaming generator yielding generated token IDs one by one."""
-        if not prompt_ids:
+        prompt_ids = self._generation_input(prompt_ids, max_new_tokens)
+        if not prompt_ids or max_new_tokens == 0:
             return
         idx = list(prompt_ids)
         V = self.vocab_size
@@ -712,8 +727,9 @@ class ModernMicroGPT:
         4. On rejection, samples replacement from normalized residual max(0, p(x) - q(x))
            and rolls back Int8 KV-cache.
         """
-        if not prompt_ids:
-            return [], 0, 0, 0
+        prompt_ids = self._generation_input(prompt_ids, max_new_tokens)
+        if not prompt_ids or max_new_tokens == 0:
+            return prompt_ids, 0, 0, 0
 
         idx = list(prompt_ids)
         prompt_len = len(idx)
@@ -728,7 +744,7 @@ class ModernMicroGPT:
         forward_passes = 0
 
         while (len(idx) - prompt_len) < max_new_tokens:
-            base_len = kv_caches[0]["seq_len"]
+            base_len = kv_caches.seq_len if getattr(kv_caches, "is_paged", False) else kv_caches[0]["seq_len"]
             remaining = max_new_tokens - (len(idx) - prompt_len)
             cur_gamma = min(gamma, max(1, remaining - 1))
 
@@ -808,7 +824,8 @@ class ModernMicroGPT:
         use_int8=True,
     ):
         """Streaming speculative decoding generator yielding tokens as verified/accepted."""
-        if not prompt_ids:
+        prompt_ids = self._generation_input(prompt_ids, max_new_tokens)
+        if not prompt_ids or max_new_tokens == 0:
             return
 
         idx = list(prompt_ids)
@@ -906,11 +923,12 @@ class ModernMicroGPT:
         Drafts multiple candidate tokens simultaneously from auxiliary prediction heads,
         then verifies in single base model forward pass.
         """
+        prompt_ids = self._generation_input(prompt_ids, max_new_tokens)
+        if not prompt_ids or max_new_tokens == 0:
+            return prompt_ids, 0, 0, 0
+
         if self.medusa_drafter is None:
             self.init_medusa()
-
-        if not prompt_ids:
-            return [], 0, 0, 0
 
         idx = list(prompt_ids)
         prompt_len = len(idx)
@@ -977,11 +995,12 @@ class ModernMicroGPT:
         use_int8=True,
     ):
         """Streaming Medusa speculative decoding generator yielding tokens as verified."""
+        prompt_ids = self._generation_input(prompt_ids, max_new_tokens)
+        if not prompt_ids or max_new_tokens == 0:
+            return
+
         if self.medusa_drafter is None:
             self.init_medusa()
-
-        if not prompt_ids:
-            return
 
         idx = list(prompt_ids)
         prompt_len = len(idx)
