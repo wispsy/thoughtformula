@@ -137,3 +137,21 @@ budget within `model.max_seq_len`. Zero budget preserves the prompt in nonstream
 results and yields nothing in streams, without cache allocation, Medusa setup or
 a forward pass. Empty prompts retain their existing empty return shapes. Sampling
 and return shapes otherwise remain compatible.
+
+
+## Bounded homegrown training
+
+`TrainingConfig`, `TrainingState`, `fit` and `evaluate` expose bounded next-token
+training over the existing autograd/Adam implementation. Callers select token
+sequences, context/step/time budgets and optional boundary stop/progress callbacks.
+Evaluation reports token-weighted loss/perplexity and exact denominators.
+
+`save_training_checkpoint` and `load_training_checkpoint` use versioned atomic
+lossless float64 parameter/Adam state for exact fixed-order resume. These bounded
+passive `.tft` artifacts are distinct from quantized inference exports, which
+retain their existing API. Checkpoints preserve model/tokenizer/config/progress
+and caller metadata; source/data identity remains the application's responsibility.
+Save at completed optimizer boundaries. `reset_optimizer` explicitly starts a new
+specialization trajectory while preserving learned weights. Auxiliary Medusa
+heads are outside this initial training artifact profile. No data/model download,
+pickle or implicit promotion occurs.
