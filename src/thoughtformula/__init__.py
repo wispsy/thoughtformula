@@ -12,7 +12,7 @@ from .training import get_cosine_lr, build_training_sequences, continual_learn_l
 from .gradcheck import run_gradient_checks
 from .cli import main
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 __all__ = [
     "FlatTensor",

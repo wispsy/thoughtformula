@@ -1,5 +1,8 @@
 # Thoughtformula 🧠
 
+Release candidate **0.3.1**: Bounded inference, deterministic sampling and resumable pretraining used by Thoughtform.
+[Published versions and main development](https://github.com/orgs/wispsy/projects/31) are tracked separately.
+
 > Pure-Python generative Transformer architecture featuring FlashAttention online softmax tiling, vLLM-style Paged KV-Cache, BitNet b1.58 ternary quantization, Grouped Query Attention (GQA), Rotary Positional Embeddings (RoPE), Sparse Mixture of Experts (MoE SwiGLU), LoRA continual learning, Kahneman-Tversky Optimization (KTO), Medusa speculative decoding, persistent binary index (.tfidx), and continuous batching. Built exclusively with Python standard library built-ins.
 
 [![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)]()
